@@ -28,6 +28,7 @@ from lerobot.configs import PolicyFeature
 from lerobot.policies import (  # noqa: F401
     ACTConfig,
     DiffusionConfig,
+    FastWAMConfig,
     PI0Config,
     PI05Config,
     SmolVLAConfig,

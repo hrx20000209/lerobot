@@ -118,6 +118,15 @@ def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False):
 # -----------------------------------------------------------------------------
 
 
+def test_supported_policies_include_fast_wam():
+    """FastWAM must be allowed by the async inference server before model loading."""
+    from lerobot.async_inference.constants import SUPPORTED_POLICIES
+    from lerobot.policies.factory import get_policy_class
+
+    assert "fast_wam" in SUPPORTED_POLICIES
+    assert get_policy_class("fast_wam").name == "fast_wam"
+
+
 def test_time_action_chunk(policy_server):
     """Verify that `_time_action_chunk` assigns correct timestamps and timesteps."""
     start_ts = time.time()

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
 import torch
@@ -46,6 +47,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .fast_wam.configuration_fast_wam import FastWAMConfig
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
@@ -104,6 +106,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .diffusion.modeling_diffusion import DiffusionPolicy
 
         return DiffusionPolicy
+    elif name == "fast_wam":
+        from .fast_wam.modeling_fast_wam import FastWAMPolicy
+
+        return FastWAMPolicy
     elif name == "act":
         from .act.modeling_act import ACTPolicy
 
@@ -186,6 +192,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":
         return DiffusionConfig(**kwargs)
+    elif policy_type == "fast_wam":
+        return FastWAMConfig(**kwargs)
     elif policy_type == "act":
         return ACTConfig(**kwargs)
     elif policy_type == "multi_task_dit":
@@ -268,6 +276,14 @@ def make_pre_post_processors(
         NotImplementedError: If a processor factory is not implemented for the given
             policy configuration type.
     """
+    if pretrained_path and isinstance(policy_cfg, FastWAMConfig) and Path(pretrained_path).is_file():
+        from .fast_wam.processor_fast_wam import make_fast_wam_pre_post_processors
+
+        return make_fast_wam_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     if pretrained_path:
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
@@ -324,6 +340,14 @@ def make_pre_post_processors(
         from .diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, FastWAMConfig):
+        from .fast_wam.processor_fast_wam import make_fast_wam_pre_post_processors
+
+        processors = make_fast_wam_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
