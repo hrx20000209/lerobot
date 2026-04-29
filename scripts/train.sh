@@ -33,7 +33,4 @@ lerobot-train \
   --policy.push_to_hub=false \
   --steps=30000 \
   --batch_size=1
-
-  python -m lerobot.async_inference.policy_server \
-     --host=0.0.0.0 \
-     --port=8080
+  
