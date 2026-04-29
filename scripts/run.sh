@@ -46,8 +46,8 @@ python -m lerobot.async_inference.robot_client \
   --policy_type=smolvla \
   --pretrained_name_or_path=/home/hrx/Projects/models/smolvla/ \
   --policy_device=cuda \
-  --actions_per_chunk=30 \
-  --chunk_size_threshold=0.8 \
+  --actions_per_chunk=50 \
+  --chunk_size_threshold=0.5 \
   --aggregate_fn_name=weighted_average \
   --debug_visualize_queue_size=True 
 
