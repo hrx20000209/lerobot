@@ -69,6 +69,7 @@ from .configs import RobotClientConfig
 from .helpers import (
     Action,
     FPSTracker,
+    LatencyRecorder,
     Observation,
     RawObservation,
     RemotePolicyConfig,
@@ -114,6 +115,8 @@ class RobotClient:
         self.logger.info(f"Initializing client to connect to server at {self.server_address}")
 
         self.shutdown_event = threading.Event()
+        self._stopped = False
+        self.latency_recorder = LatencyRecorder("robot_client")
 
         # Initialize client side variables
         self.latest_action_lock = threading.Lock()
@@ -147,6 +150,7 @@ class RobotClient:
             start_time = time.perf_counter()
             self.stub.Ready(services_pb2.Empty())
             end_time = time.perf_counter()
+            self.latency_recorder.record("client_start", ready_rpc_ms=(end_time - start_time) * 1000)
             self.logger.debug(f"Connected to policy server in {end_time - start_time:.4f}s")
 
             # send policy instructions
@@ -160,7 +164,12 @@ class RobotClient:
                 f"Device: {self.policy_config.device}"
             )
 
+            setup_start = time.perf_counter()
             self.stub.SendPolicyInstructions(policy_setup)
+            self.latency_recorder.record(
+                "client_start",
+                send_policy_instructions_ms=(time.perf_counter() - setup_start) * 1000,
+            )
 
             self.shutdown_event.clear()
 
@@ -172,6 +181,9 @@ class RobotClient:
 
     def stop(self):
         """Stop the robot client"""
+        if self._stopped:
+            return
+        self._stopped = True
         self.shutdown_event.set()
 
         self.robot.disconnect()
@@ -179,6 +191,8 @@ class RobotClient:
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
+        self.latency_recorder.log_summary(self.logger)
+        self.latency_recorder.close()
 
     def send_observation(
         self,
@@ -198,6 +212,7 @@ class RobotClient:
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
         try:
+            send_start = time.perf_counter()
             observation_iterator = send_bytes_in_chunks(
                 observation_bytes,
                 services_pb2.Observation,
@@ -205,8 +220,17 @@ class RobotClient:
                 silent=True,
             )
             _ = self.stub.SendObservations(observation_iterator)
+            send_rpc_time = time.perf_counter() - send_start
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            self.latency_recorder.record(
+                "client_send_observation",
+                timestep=obs_timestep,
+                serialize_ms=serialize_time * 1000,
+                send_rpc_ms=send_rpc_time * 1000,
+                total_ms=(serialize_time + send_rpc_time) * 1000,
+                must_go=int(obs.must_go),
+            )
 
             return True
 
@@ -275,7 +299,9 @@ class RobotClient:
         while self.running:
             try:
                 # Use StreamActions to get a stream of actions from the server
+                get_actions_start = time.perf_counter()
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
+                get_actions_rpc_time = time.perf_counter() - get_actions_start
                 if len(actions_chunk.data) == 0:
                     continue  # received `Empty` from server, wait for next call
 
@@ -302,6 +328,30 @@ class RobotClient:
                     self.logger.debug(f"Actions kept on device: {client_device}")
 
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
+                first_action_timestep = timed_actions[0].get_timestep() if timed_actions else -1
+                last_action_timestep = timed_actions[-1].get_timestep() if timed_actions else -1
+                observation_to_actions_latency = (
+                    (receive_time - timed_actions[0].get_timestamp()) * 1000 if timed_actions else 0
+                )
+                server_latency = {}
+                server_timestamp = None
+                if timed_actions:
+                    metadata = timed_actions[0].get_metadata()
+                    if isinstance(metadata, dict):
+                        server_latency = metadata.get("server_latency", {}) or {}
+                        server_timestamp = metadata.get("server_timestamp")
+                server_to_client_latency = (
+                    (receive_time - server_timestamp) * 1000
+                    if isinstance(server_timestamp, int | float) and not isinstance(server_timestamp, bool)
+                    else observation_to_actions_latency
+                )
+                if server_latency:
+                    self.latency_recorder.record(
+                        "server_action_chunk",
+                        first_timestep=first_action_timestep,
+                        last_timestep=last_action_timestep,
+                        **server_latency,
+                    )
 
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:
@@ -318,9 +368,6 @@ class RobotClient:
                     # Log incoming actions
                     incoming_timesteps = [a.get_timestep() for a in timed_actions]
 
-                    first_action_timestep = timed_actions[0].get_timestep()
-                    server_to_client_latency = (receive_time - timed_actions[0].get_timestamp()) * 1000
-
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
                         f"Latest action: #{latest_action} | "
@@ -333,6 +380,18 @@ class RobotClient:
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
+                self.latency_recorder.record(
+                    "client_receive_actions",
+                    first_timestep=first_action_timestep,
+                    last_timestep=last_action_timestep,
+                    actions_count=len(timed_actions),
+                    get_actions_rpc_ms=get_actions_rpc_time * 1000,
+                    server_to_client_ms=server_to_client_latency,
+                    observation_to_actions_ms=observation_to_actions_latency,
+                    deserialize_ms=deserialize_time * 1000,
+                    queue_update_ms=queue_update_time * 1000,
+                    total_ms=(get_actions_rpc_time + deserialize_time + queue_update_time) * 1000,
+                )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
@@ -378,11 +437,21 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
+        send_start = time.perf_counter()
         _performed_action = self.robot.send_action(
             self._action_tensor_to_action_dict(timed_action.get_action())
         )
+        send_action_time = time.perf_counter() - send_start
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+        self.latency_recorder.record(
+            "client_execute_action",
+            timestep=timed_action.get_timestep(),
+            queue_pop_ms=get_end * 1000,
+            robot_send_action_ms=send_action_time * 1000,
+            action_age_ms=(time.time() - timed_action.get_timestamp()) * 1000,
+            total_ms=(get_end + send_action_time) * 1000,
+        )
 
         if verbose:
             with self.action_queue_lock:
@@ -430,6 +499,13 @@ class RobotClient:
                 current_queue_size = self.action_queue.qsize()
 
             _ = self.send_observation(observation)
+            self.latency_recorder.record(
+                "client_capture_observation",
+                timestep=observation.get_timestep(),
+                capture_ms=obs_capture_time * 1000,
+                queue_size=current_queue_size,
+                must_go=int(observation.must_go),
+            )
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
@@ -475,6 +551,10 @@ class RobotClient:
                 _captured_observation = self.control_loop_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+            self.latency_recorder.record(
+                "client_control_loop",
+                total_ms=(time.perf_counter() - control_loop_start) * 1000,
+            )
             # Dynamically adjust sleep time to maintain the desired control frequency
             time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 

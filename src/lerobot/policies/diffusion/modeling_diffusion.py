@@ -21,6 +21,7 @@ TODO(alexander-soare):
 """
 
 import math
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -98,6 +99,10 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+
+    def get_and_reset_latency_profile(self) -> dict[str, float]:
+        """Return the last diffusion model inference profile and clear it."""
+        return self.diffusion.get_and_reset_latency_profile()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -217,6 +222,26 @@ class DiffusionModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+        self.last_latency_profile: dict[str, float] = {}
+
+    def _sync_latency_device(self) -> None:
+        device = get_device_from_parameters(self)
+        if torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+
+    def _profile_start(self) -> float:
+        self._sync_latency_device()
+        return time.perf_counter()
+
+    def _profile_elapsed_ms(self, start: float) -> float:
+        self._sync_latency_device()
+        return (time.perf_counter() - start) * 1000
+
+    def get_and_reset_latency_profile(self) -> dict[str, float]:
+        profile = dict(self.last_latency_profile)
+        self.last_latency_profile = {}
+        return profile
+
     # ========= inference  ============
     def conditional_sample(
         self,
@@ -227,8 +252,10 @@ class DiffusionModel(nn.Module):
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
+        profile: dict[str, float] = {}
 
         # Sample prior.
+        sample_start = self._profile_start()
         sample = (
             noise
             if noise is not None
@@ -239,10 +266,14 @@ class DiffusionModel(nn.Module):
                 generator=generator,
             )
         )
+        profile["sample_init_ms"] = self._profile_elapsed_ms(sample_start)
 
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
+        diffusion_step_times = []
+        diffusion_loop_start = self._profile_start()
         for t in self.noise_scheduler.timesteps:
+            step_start = self._profile_start()
             # Predict model output.
             model_output = self.unet(
                 sample,
@@ -251,7 +282,14 @@ class DiffusionModel(nn.Module):
             )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
+            diffusion_step_times.append(self._profile_elapsed_ms(step_start))
 
+        profile["diffusion_loop_ms"] = self._profile_elapsed_ms(diffusion_loop_start)
+        profile["diffusion_steps"] = float(len(diffusion_step_times))
+        if diffusion_step_times:
+            profile["diffusion_step_mean_ms"] = sum(diffusion_step_times) / len(diffusion_step_times)
+            profile["diffusion_step_max_ms"] = max(diffusion_step_times)
+        self.last_latency_profile.update(profile)
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
@@ -305,17 +343,32 @@ class DiffusionModel(nn.Module):
         """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
+        total_start = self._profile_start()
 
         # Encode image features and concatenate them all together along with the state vector.
+        encode_start = self._profile_start()
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+        encode_ms = self._profile_elapsed_ms(encode_start)
 
         # run sampling
+        sample_start = self._profile_start()
         actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        sample_ms = self._profile_elapsed_ms(sample_start)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
+        select_start = self._profile_start()
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+        select_action_slice_ms = self._profile_elapsed_ms(select_start)
+        self.last_latency_profile.update(
+            {
+                "encode_ms": encode_ms,
+                "sample_ms": sample_ms,
+                "select_action_slice_ms": select_action_slice_ms,
+                "generate_total_ms": self._profile_elapsed_ms(total_start),
+            }
+        )
 
         return actions
 

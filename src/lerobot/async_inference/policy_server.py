@@ -51,6 +51,7 @@ from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
 from .helpers import (
     FPSTracker,
+    LatencyRecorder,
     Observation,
     RemotePolicyConfig,
     TimedAction,
@@ -71,6 +72,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
+        self.latency_recorder = LatencyRecorder("policy_server")
 
         self.observation_queue = Queue(maxsize=1)
 
@@ -165,6 +167,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
         end = time.perf_counter()
+        self.latency_recorder.record(
+            "server_policy_setup",
+            total_ms=(end - start) * 1000,
+        )
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
@@ -204,9 +210,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
-        if not self._enqueue_observation(
+        enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
-        ):
+        )
+        self.latency_recorder.record(
+            "server_receive_observation",
+            timestep=obs_timestep,
+            client_to_server_ms=(receive_time - obs_timestamp) * 1000,
+            deserialize_ms=deserialize_time * 1000,
+            enqueued=int(enqueued),
+        )
+        if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
         return services_pb2.Empty()
@@ -221,6 +235,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         try:
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
+            queue_wait_time = time.perf_counter() - getactions_starts
             self.logger.info(
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
             )
@@ -229,10 +244,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 self._predicted_timesteps.add(obs.get_timestep())
 
             start_time = time.perf_counter()
-            action_chunk = self._predict_action_chunk(obs)
+            action_chunk, predict_timing = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
+            if action_chunk:
+                action_chunk[0].metadata["server_timestamp"] = time.time()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
             serialize_time = time.perf_counter() - start_time
 
@@ -251,9 +268,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Total time: {inference_time + serialize_time:.2f}s"
             )
 
-            time.sleep(
-                max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
-            )  # sleep controls inference latency
+            sleep_time = max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
+            self.latency_recorder.record(
+                "server_action_chunk",
+                timestep=obs.get_timestep(),
+                queue_wait_ms=queue_wait_time * 1000,
+                inference_ms=inference_time * 1000,
+                serialize_ms=serialize_time * 1000,
+                sleep_ms=sleep_time * 1000,
+                total_ms=(time.perf_counter() - getactions_starts) * 1000,
+                **predict_timing,
+            )
+
+            time.sleep(sleep_time)  # sleep controls inference latency
 
             return actions
 
@@ -309,15 +336,30 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                metadata=metadata if i == 0 and metadata is not None else {},
+            )
             for i, action in enumerate(action_chunk)
         ]
+
+    def _sync_policy_device(self) -> None:
+        if self.device is not None and torch.cuda.is_available() and str(self.device).startswith("cuda"):
+            torch.cuda.synchronize(torch.device(str(self.device)))
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
@@ -327,7 +369,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return chunk[:, : self.actions_per_chunk, :]
 
-    def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
+    def _extract_policy_profile(self) -> dict[str, float]:
+        profile = {}
+        candidates = [
+            self.policy,
+            getattr(self.policy, "model", None),
+            getattr(self.policy, "diffusion", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            getter = getattr(candidate, "get_and_reset_latency_profile", None)
+            if callable(getter):
+                data = getter()
+            else:
+                data = getattr(candidate, "last_latency_profile", None)
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, int | float) and not isinstance(value, bool):
+                        profile[f"model_{key}"] = float(value)
+        return profile
+
+    def _predict_action_chunk(self, observation_t: TimedObservation) -> tuple[list[TimedAction], dict[str, float]]:
         """Predict an action chunk based on an observation.
 
         Pipeline:
@@ -347,14 +410,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""
+        self._sync_policy_device()
         start_preprocess = time.perf_counter()
         observation = self.preprocessor(observation)
+        self._sync_policy_device()
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
+        self._sync_policy_device()
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
+        self._sync_policy_device()
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
@@ -364,6 +431,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Apply postprocessor (handles unnormalization and device movement)
         # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
         # So we process each action in the chunk individually
+        self._sync_policy_device()
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
 
@@ -380,13 +448,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()
+        self._sync_policy_device()
 
         """5. Convert to TimedAction list"""
-        action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
-        )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
+        timing = {
+            "prepare_ms": prepare_time * 1000,
+            "preprocess_ms": preprocessing_time * 1000,
+            "policy_predict_ms": inference_time * 1000,
+            "postprocess_ms": postprocessing_time * 1000,
+            "predict_total_ms": (postprocess_stops - start_prepare) * 1000,
+        }
+        timing.update(self._extract_policy_profile())
+        action_chunk = self._time_action_chunk(
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            metadata={"server_latency": timing},
+        )
 
         self.logger.info(
             f"Observation {observation_t.get_timestep()} | "
@@ -402,11 +482,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
         )
 
-        return action_chunk
+        return action_chunk, timing
 
     def stop(self):
         """Stop the server"""
         self._reset_server()
+        self.latency_recorder.log_summary(self.logger)
+        self.latency_recorder.close()
         self.logger.info("Server stopping...")
 
 
@@ -430,9 +512,14 @@ def serve(cfg: PolicyServerConfig):
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
 
-    server.wait_for_termination()
-
-    policy_server.logger.info("Server terminated")
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        policy_server.logger.info("KeyboardInterrupt received, stopping server...")
+    finally:
+        policy_server.stop()
+        server.stop(grace=0)
+        policy_server.logger.info("Server terminated")
 
 
 if __name__ == "__main__":

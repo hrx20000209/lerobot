@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import logging.handlers
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +51,115 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
+
+
+class LatencyRecorder:
+    """Thread-safe JSONL latency recorder with simple aggregate summaries."""
+
+    def __init__(self, name: str, log_dir: str | Path = "logs", enabled: bool = True):
+        self.name = name
+        self.enabled = enabled
+        self.records: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.path = self.log_dir / f"{name}_latency_{timestamp}.jsonl"
+        self.summary_path = self.log_dir / f"{name}_latency_summary_{timestamp}.json"
+        self._file = self.path.open("a", encoding="utf-8") if enabled else None
+
+    def _sync_cuda(self, device: str | torch.device | None = None) -> None:
+        if not torch.cuda.is_available():
+            return
+        if device is None:
+            torch.cuda.synchronize()
+            return
+        device_str = str(device)
+        if device_str.startswith("cuda"):
+            torch.cuda.synchronize(torch.device(device_str))
+
+    def now(self, device: str | torch.device | None = None) -> float:
+        self._sync_cuda(device)
+        return time.perf_counter()
+
+    def elapsed_ms(self, start: float, device: str | torch.device | None = None) -> float:
+        self._sync_cuda(device)
+        return (time.perf_counter() - start) * 1000
+
+    def record(self, kind: str, **metrics: Any) -> dict[str, Any]:
+        record = {
+            "time": time.time(),
+            "kind": kind,
+            **metrics,
+        }
+        if not self.enabled:
+            return record
+
+        with self._lock:
+            self.records.append(record)
+            if self._file is not None and not self._file.closed:
+                self._file.write(json.dumps(record, default=str) + "\n")
+                self._file.flush()
+        return record
+
+    @staticmethod
+    def _is_summary_number(key: str, value: Any) -> bool:
+        if key in {"time", "timestamp", "timestep", "first_timestep", "last_timestep"}:
+            return False
+        return isinstance(value, int | float) and not isinstance(value, bool)
+
+    def summary(self) -> dict[str, dict[str, dict[str, float | int]]]:
+        grouped: dict[str, dict[str, list[float]]] = {}
+        with self._lock:
+            records = list(self.records)
+        for record in records:
+            kind = str(record.get("kind", "unknown"))
+            grouped.setdefault(kind, {})
+            for key, value in record.items():
+                if self._is_summary_number(key, value):
+                    grouped[kind].setdefault(key, []).append(float(value))
+
+        summary: dict[str, dict[str, dict[str, float | int]]] = {}
+        for kind, metrics in grouped.items():
+            summary[kind] = {}
+            for key, values in metrics.items():
+                values_sorted = sorted(values)
+                count = len(values_sorted)
+                if count == 0:
+                    continue
+                p50 = values_sorted[count // 2]
+                p90 = values_sorted[min(count - 1, int(count * 0.9))]
+                summary[kind][key] = {
+                    "count": count,
+                    "mean": sum(values_sorted) / count,
+                    "p50": p50,
+                    "p90": p90,
+                    "max": max(values_sorted),
+                }
+        return summary
+
+    def write_summary(self) -> Path:
+        summary = self.summary()
+        self.summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        return self.summary_path
+
+    def log_summary(self, logger: logging.Logger) -> None:
+        summary_path = self.write_summary()
+        logger.info(f"Latency records saved to {self.path}")
+        logger.info(f"Latency summary saved to {summary_path}")
+        summary = self.summary()
+        for kind, metrics in summary.items():
+            logger.info(f"Latency summary: {kind}")
+            for key, stats in sorted(metrics.items()):
+                logger.info(
+                    f"  {key}: mean={stats['mean']:.2f}, p50={stats['p50']:.2f}, "
+                    f"p90={stats['p90']:.2f}, max={stats['max']:.2f}, n={stats['count']}"
+                )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file is not None and not self._file.closed:
+                self._file.close()
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:
@@ -221,9 +332,13 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_action(self):
         return self.action
+
+    def get_metadata(self):
+        return self.metadata
 
 
 @dataclass
