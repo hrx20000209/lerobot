@@ -43,8 +43,8 @@ python -m lerobot.async_inference.robot_client \
   --robot.id=follower_arm \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --task="Grab the blue block" \
-  --policy_type=pi05 \
-  --pretrained_name_or_path=/home/hrx/Projects/models/pi05/ \
+  --policy_type=smolvla \
+  --pretrained_name_or_path=/home/hrx/Projects/models/smolvla/ \
   --policy_device=cuda \
   --actions_per_chunk=50 \
   --chunk_size_threshold=0.2 \
