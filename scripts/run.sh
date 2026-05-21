@@ -27,7 +27,7 @@ python -m lerobot.async_inference.robot_client \
   --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --task="Grab the blue block" \
   --policy_type=act \
-  --pretrained_name_or_path=/home/hrx/Projects/models/pi05/ \
+  --pretrained_name_or_path=/home/hrx/Projects/models/act/ \
   --policy_device=cuda \
   --actions_per_chunk=50 \
   --chunk_size_threshold=0.5 \
