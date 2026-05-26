@@ -27,7 +27,7 @@ lerobot-record \
     --teleop.id=leader_arm \
     --display_data=true \
     --dataset.repo_id=hrx2000/Red_Rectangular \
-    --dataset.num_episodes=100 \
+    --dataset.num_episodes=50 \
     --dataset.single_task="Pick up the red rectangular block from the box and place it on the table." \
     --dataset.push_to_hub=true \
     --dataset.episode_time_s=20 \
