@@ -1,5 +1,5 @@
 # data collection
-# Blue cube
+# 3 cube
 lerobot-record \
     --robot.type=so101_follower \
     --robot.port=/dev/ttyACM0 \
@@ -9,12 +9,16 @@ lerobot-record \
     --teleop.port=/dev/ttyACM1 \
     --teleop.id=leader_arm \
     --display_data=true \
-    --dataset.repo_id=hrx2000/Blue_Cube \
-    --dataset.num_episodes=100 \
-    --dataset.single_task="Pick up the blue cube into the box." \
+    --dataset.repo_id=hrx2000/Three_Boxes_1 \
+    --dataset.num_episodes=60 \
+    --dataset.single_task="go to left dark box. take the red cube. go to middle light-colored box. put the red cube in box." \
     --dataset.push_to_hub=true \
-    --dataset.episode_time_s=20 \
-    --dataset.reset_time_s=3
+    --dataset.episode_time_s=17 \
+    --dataset.reset_time_s=2 \
+    --dataset.root="/home/hrx/.cache/huggingface/lerobot/hrx2000/Three_Boxes_1" \
+    --resume=true
+
+#previous_task --task="go to red cube. take the red cube. go to box. put the red cube in box."
 
 # Red Rectangle
 lerobot-record \
@@ -26,12 +30,12 @@ lerobot-record \
     --teleop.port=/dev/ttyACM1 \
     --teleop.id=leader_arm \
     --display_data=true \
-    --dataset.repo_id=hrx2000/Red_Rectangular \
+    --dataset.repo_id=hrx2000/Move_Cube \
     --dataset.num_episodes=50 \
-    --dataset.single_task="Pick up the red rectangular block from the box and place it on the table." \
+    --dataset.single_task="Go to cube in the right box. Take the cube. Go to the left box. Put the cube in the left box." \
     --dataset.push_to_hub=true \
-    --dataset.episode_time_s=20 \
-    --dataset.reset_time_s=3
+    --dataset.episode_time_s=15 \
+    --dataset.reset_time_s=3 
 
 
 

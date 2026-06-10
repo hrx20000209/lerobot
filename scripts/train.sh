@@ -15,21 +15,21 @@ CUDA_VISIBLE_DEVICES=6 lerobot-train \
   --save_freq=4000 
 
 
-CUDA_VISIBLE_DEVICES=1 lerobot-train \
+CUDA_VISIBLE_DEVICES=0 lerobot-train \
   --policy.type=act \
-  --dataset.repo_id=hrx2000/Move_Block \
-  --dataset.root=/data/rxhuang/move_block/ \
+  --dataset.repo_id=hrx2000/Three_Cubes_1 \
+  --dataset.root=/data/rxhuang/three_cubes_1/ \
   --dataset.revision=v0.1.0 \
   --dataset.streaming=false \
-  --output_dir=output_lerobot_train/move_block/act \
-  --job_name=move_block \
+  --output_dir=output_lerobot_train/three_cubes/act \
+  --job_name=cubes \
   --policy.device=cuda \
   --wandb.enable=false \
   --wandb.project=Lerobot_Blue_Cube \
   --policy.push_to_hub=false \
-  --steps=10000 \
-  --batch_size=64 \
-  --save_freq=2000 
+  --steps=40000 \
+  --batch_size=32 \
+  --save_freq=4000 
 
 
 
