@@ -1270,16 +1270,22 @@ class PI05Policy(PreTrainedPolicy):
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
-        # Compute loss (no separate state needed for PI05)
+        # Compute loss on the full padded action vector. OpenPI zero-pads short
+        # action vectors to action_dim and supervises the padded dimensions too;
+        # otherwise those dimensions stay random at inference and still affect
+        # the shared action projection.
         losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
 
-        # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        action_losses = losses[:, :, :original_action_dim]
+        padded_losses = losses[:, :, original_action_dim:]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": action_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_action_dims": action_losses.mean().item(),
         }
+        if padded_losses.numel() > 0:
+            loss_dict["loss_padded_dims"] = padded_losses.mean().item()
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims

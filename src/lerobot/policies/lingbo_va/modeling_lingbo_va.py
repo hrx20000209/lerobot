@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -122,10 +123,15 @@ class LingBoVAPolicy(PreTrainedPolicy):
         return self
 
     def parameters(self, recurse: bool = True):
+        seen: set[int] = set()
         transformer = getattr(self, "_transformer", None)
         if transformer is not None:
-            yield from transformer.parameters(recurse=recurse)
-        yield from super().parameters(recurse=recurse)
+            for param in transformer.parameters(recurse=recurse):
+                seen.add(id(param))
+                yield param
+        for param in super().parameters(recurse=recurse):
+            if id(param) not in seen:
+                yield param
 
     def named_parameters(
         self,
@@ -133,19 +139,24 @@ class LingBoVAPolicy(PreTrainedPolicy):
         recurse: bool = True,
         remove_duplicate: bool = True,
     ):
+        seen: set[int] = set()
         transformer = getattr(self, "_transformer", None)
         if transformer is not None:
             model_prefix = f"{prefix}._transformer" if prefix else "_transformer"
-            yield from transformer.named_parameters(
+            for name, param in transformer.named_parameters(
                 prefix=model_prefix,
                 recurse=recurse,
                 remove_duplicate=remove_duplicate,
-            )
-        yield from super().named_parameters(
+            ):
+                seen.add(id(param))
+                yield name, param
+        for name, param in super().named_parameters(
             prefix=prefix,
             recurse=recurse,
             remove_duplicate=remove_duplicate,
-        )
+        ):
+            if id(param) not in seen:
+                yield name, param
 
     def get_optim_params(self) -> list:
         self._ensure_local_runtime(for_training=True)
@@ -237,6 +248,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         self._install_lingbo_import_path()
         try:
             from wan_va.modules.utils import WanVAEStreamingWrapper, load_text_encoder, load_tokenizer, load_transformer, load_vae
+            from wan_va.distributed.fsdp import apply_ac
             from wan_va.utils import data_seq_to_patch, get_mesh_id, sample_timestep_id
             from wan_va.utils.scheduler import FlowMatchScheduler
         except ModuleNotFoundError as exc:
@@ -257,8 +269,17 @@ class LingBoVAPolicy(PreTrainedPolicy):
             torch_device=transformer_device,
             attn_mode=self.config.train_attn_mode if for_training else self.config.inference_attn_mode,
         )
-        if self.config.gradient_checkpointing and hasattr(transformer, "enable_gradient_checkpointing"):
-            transformer.enable_gradient_checkpointing()
+        if for_training and self.config.gradient_checkpointing:
+            try:
+                apply_ac(transformer)
+            except Exception as exc:
+                if hasattr(transformer, "enable_gradient_checkpointing"):
+                    try:
+                        transformer.enable_gradient_checkpointing()
+                    except ValueError:
+                        logging.warning("LingBoVA gradient checkpointing is unavailable: %s", exc)
+                else:
+                    logging.warning("LingBoVA gradient checkpointing is unavailable: %s", exc)
 
         vae = load_vae(str(model_root / "vae"), torch_dtype=dtype, torch_device=vae_device)
         text_encoder = load_text_encoder(
@@ -419,7 +440,8 @@ class LingBoVAPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def _encode_video_latents(self, batch: dict[str, Any]) -> Tensor:
         camera_keys = self._resolve_camera_keys(batch)
-        frame_ids = [idx * self.config.action_per_frame for idx in range(self.config.frame_chunk_size)]
+        num_vae_input_frames = (self.config.frame_chunk_size - 1) * self.config.vae_temporal_stride + 1
+        frame_ids = [idx * self.config.video_frame_stride for idx in range(num_vae_input_frames)]
         videos = []
         for key in camera_keys:
             seq = self._as_image_sequence(batch[key])[:, frame_ids]
@@ -429,9 +451,12 @@ class LingBoVAPolicy(PreTrainedPolicy):
         video = video.reshape(batch_size * num_cameras, num_frames, channels, height, width)
         video = video.permute(0, 2, 1, 3, 4).contiguous()
 
+        target_vae_device = torch.device(self.config.vae_device or self.config.device)
+        if next(self._vae.parameters()).device != target_vae_device:
+            self._vae.to(target_vae_device)
         self._streaming_vae.clear_cache()
         vae_device = next(self._vae.parameters()).device
-        enc = self._streaming_vae.encode_chunk(video.to(device=vae_device, dtype=self._vae.dtype))
+        enc = self._encode_vae_chunk(video.to(device=vae_device, dtype=self._vae.dtype))
         mu, _ = torch.chunk(enc, 2, dim=1)
         latents_mean = torch.tensor(self._vae.config.latents_mean, device=mu.device, dtype=torch.float32)
         latents_std = torch.tensor(self._vae.config.latents_std, device=mu.device, dtype=torch.float32)
@@ -439,7 +464,23 @@ class LingBoVAPolicy(PreTrainedPolicy):
         _, channels_latent, frames_latent, height_latent, width_latent = mu.shape
         mu = mu.reshape(batch_size, num_cameras, channels_latent, frames_latent, height_latent, width_latent)
         latents = torch.cat([mu[:, idx] for idx in range(num_cameras)], dim=-1)
-        return latents.to(device=next(self._transformer.parameters()).device, dtype=_dtype_from_config(self.config.dtype))
+        if latents.shape[2] != self.config.frame_chunk_size:
+            raise ValueError(
+                "LingBoVA VAE produced an unexpected number of latent frames: "
+                f"{latents.shape[2]} vs frame_chunk_size={self.config.frame_chunk_size}. "
+                "Check vae_temporal_stride/video_frame_stride/num_frames."
+            )
+        latents = latents.to(device=next(self._transformer.parameters()).device, dtype=_dtype_from_config(self.config.dtype))
+        if self.config.offload_vae_after_encode and target_vae_device.type == "cuda":
+            self._vae.to("cpu")
+            torch.cuda.empty_cache()
+        return latents
+
+    def _encode_vae_chunk(self, video: Tensor) -> Tensor:
+        try:
+            return self._vae.encode(video).latent_dist.parameters
+        except Exception:
+            return self._streaming_vae.encode_chunk(video)
 
     def _build_model_actions(self, batch: dict[str, Any]) -> tuple[Tensor, Tensor]:
         action = torch.as_tensor(batch[ACTION], dtype=torch.float32)
@@ -452,7 +493,14 @@ class LingBoVAPolicy(PreTrainedPolicy):
             raise ValueError(f"Expected action_dim={self.config.action_dim}, got {action.shape[-1]}.")
 
         batch_size = action.shape[0]
-        padded = torch.zeros(batch_size, self.config.chunk_size, self.config.action_dim + 1, dtype=torch.float32)
+        action_device = action.device
+        padded = torch.zeros(
+            batch_size,
+            self.config.chunk_size,
+            self.config.action_dim + 1,
+            dtype=torch.float32,
+            device=action_device,
+        )
         padded[:, :, : self.config.action_dim] = action
         inverse = self._inverse_used_action_channel_ids()
         aligned = padded[:, :, inverse]
@@ -465,10 +513,16 @@ class LingBoVAPolicy(PreTrainedPolicy):
             n=self.config.action_per_frame,
         )
 
-        valid = torch.ones(batch_size, self.config.chunk_size, self.config.lingbo_action_dim, dtype=torch.bool)
+        valid = torch.ones(
+            batch_size,
+            self.config.chunk_size,
+            self.config.lingbo_action_dim,
+            dtype=torch.bool,
+            device=action_device,
+        )
         if ACTION + "_is_pad" in batch:
             valid = valid & ~torch.as_tensor(batch[ACTION + "_is_pad"], dtype=torch.bool)[:, : self.config.chunk_size, None]
-        channel_mask = torch.zeros(self.config.lingbo_action_dim, dtype=torch.bool)
+        channel_mask = torch.zeros(self.config.lingbo_action_dim, dtype=torch.bool, device=action_device)
         channel_mask[self.config.used_action_channel_ids] = True
         valid = valid & channel_mask.view(1, 1, -1)
         valid = rearrange(valid, "b (f n) c -> b c f n 1", f=self.config.frame_chunk_size, n=self.config.action_per_frame)
@@ -590,6 +644,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
                 return_attention_mask=True,
                 return_tensors="pt",
             )
+            target_text_device = torch.device(self.config.text_encoder_device or self.config.device)
+            if next(self._text_encoder.parameters()).device != target_text_device:
+                self._text_encoder.to(target_text_device)
             text_device = next(self._text_encoder.parameters()).device
             embeds = self._text_encoder(
                 inputs.input_ids.to(text_device),
@@ -603,6 +660,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
                 padded.append(cur.detach().cpu())
             for prompt, emb in zip(uncached, padded):
                 self._prompt_cache[prompt] = emb
+            if self.config.offload_text_encoder_after_encode and target_text_device.type == "cuda":
+                self._text_encoder.to("cpu")
+                torch.cuda.empty_cache()
         out = torch.stack([self._prompt_cache[prompt] for prompt in prompts], dim=0)
         return out
 
@@ -746,6 +806,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         base = deepcopy(VA_CONFIGS.get(self.config.va_config_name, VA_CONFIGS["demo"]))
         cfg = EasyDict(base)
         cfg.wan22_pretrained_model_name_or_path = str(self._resolve_model_root())
+        cfg.transformer_path = str(self._resolve_transformer_path())
         cfg.attn_window = int(self.config.attn_window)
         cfg.frame_chunk_size = int(self.config.frame_chunk_size)
         cfg.env_type = self.config.env_type

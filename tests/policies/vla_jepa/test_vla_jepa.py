@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,6 +36,7 @@ from conftest import (  # noqa: E402
 
 from lerobot.policies.vla_jepa.configuration_vla_jepa import VLAJEPAConfig  # noqa: E402
 from lerobot.policies.vla_jepa.modeling_vla_jepa import VLAJEPAPolicy  # noqa: E402
+from lerobot.policies.vla_jepa.qwen_interface import Qwen3VLInterface  # noqa: E402
 from lerobot.utils.constants import ACTION  # noqa: E402
 
 PRETRAINED_REPO_ID = "ginwind/VLA-JEPA"
@@ -44,6 +46,38 @@ PRETRAINED_SUBFOLDER = "LIBERO"
 # skipped by default.  Set VLA_JEPA_EXTENDED=1 to opt in.
 _VLA_JEPA_EXTENDED = os.environ.get("VLA_JEPA_EXTENDED", "0") != "0"
 extended_test = pytest.mark.skipif(not _VLA_JEPA_EXTENDED, reason="Set VLA_JEPA_EXTENDED=1 to run hub tests")
+
+
+def test_qwen_build_inputs_requests_tensor_output() -> None:
+    captured_kwargs = {}
+
+    class _Batch(dict):
+        def to(self, device):
+            captured_kwargs["device"] = device
+            return self
+
+    class _Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _Batch(input_ids=torch.ones((len(messages), 1), dtype=torch.long))
+
+    interface = Qwen3VLInterface.__new__(Qwen3VLInterface)
+    torch.nn.Module.__init__(interface)
+    interface.config = SimpleNamespace(prompt_template="{instruction} {actions} {e_actions}")
+    interface.processor = _Processor()
+    interface.model = SimpleNamespace(device=torch.device("cpu"))
+
+    inputs = interface.build_inputs(
+        images=[[object()]],
+        instructions=["move"],
+        action_prompt="actions",
+        embodied_prompt="embodied",
+    )
+
+    assert isinstance(inputs["input_ids"], Tensor)
+    assert captured_kwargs["padding"] is True
+    assert captured_kwargs["return_tensors"] == "pt"
+    assert "processor_kwargs" not in captured_kwargs
 
 
 # ---------------------------------------------------------------------------

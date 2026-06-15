@@ -22,6 +22,7 @@ from .factory import get_policy_class, make_policy, make_policy_config, make_pre
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
+from .lingbo_va.configuration_lingbo_va import LingBoVAConfig as LingBoVAConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
@@ -47,6 +48,7 @@ __all__ = [
     "GaussianActorConfig",
     "GrootConfig",
     "MolmoAct2Config",
+    "LingBoVAConfig",
     "MultiTaskDiTConfig",
     "PI0Config",
     "PI0FastConfig",

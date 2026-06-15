@@ -99,7 +99,8 @@ class Qwen3VLInterface(torch.nn.Module):
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
-            processor_kwargs={"padding": True, "return_tensors": "pt"},
+            padding=True,
+            return_tensors="pt",
         )
         return batch_inputs.to(self.model.device)
 

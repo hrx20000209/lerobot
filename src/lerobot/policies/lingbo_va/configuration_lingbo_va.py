@@ -24,6 +24,8 @@ class LingBoVAConfig(PreTrainedConfig):
     num_frames: int = 33
     frame_chunk_size: int = 4
     action_per_frame: int = 8
+    vae_temporal_stride: int = 4
+    video_frame_stride: int | None = None
 
     action_dim: int = 6
     lingbo_action_dim: int = 30
@@ -69,6 +71,8 @@ class LingBoVAConfig(PreTrainedConfig):
     vae_device: str | None = None
     text_encoder_device: str | None = "cpu"
     transformer_device: str | None = None
+    offload_vae_after_encode: bool = True
+    offload_text_encoder_after_encode: bool = True
     gradient_checkpointing: bool = True
 
     norm_default_mode: str = "q01/q99"
@@ -90,10 +94,25 @@ class LingBoVAConfig(PreTrainedConfig):
                 "chunk_size must equal frame_chunk_size * action_per_frame, got "
                 f"{self.chunk_size} vs {self.frame_chunk_size} * {self.action_per_frame}."
             )
+        if self.vae_temporal_stride <= 0:
+            raise ValueError("vae_temporal_stride must be positive.")
+        if self.video_frame_stride is None:
+            if self.action_per_frame % self.vae_temporal_stride != 0:
+                raise ValueError(
+                    "action_per_frame must be divisible by vae_temporal_stride when "
+                    "video_frame_stride is not set."
+                )
+            self.video_frame_stride = max(1, self.action_per_frame // self.vae_temporal_stride)
+        if self.video_frame_stride <= 0:
+            raise ValueError("video_frame_stride must be positive.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError("n_action_steps cannot be greater than chunk_size.")
-        if self.num_frames < self.chunk_size + 1:
-            raise ValueError("num_frames must cover the action chunk plus the current frame.")
+        required_frames = (self.frame_chunk_size - 1) * self.video_frame_stride * self.vae_temporal_stride + 1
+        if self.num_frames < required_frames:
+            raise ValueError(
+                "num_frames must cover the video frames needed by the Wan VAE, got "
+                f"{self.num_frames} but need at least {required_frames}."
+            )
         if self.inference_backend not in {"server", "local"}:
             raise ValueError("inference_backend must be one of: 'server', 'local'.")
         if self.dtype not in {"bfloat16", "bf16", "float16", "fp16", "float32", "fp32"}:

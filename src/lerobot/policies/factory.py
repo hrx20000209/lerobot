@@ -52,6 +52,7 @@ from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config
+from .lingbo_va.configuration_lingbo_va import LingBoVAConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -148,6 +149,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
+    elif name == "lingbo_va":
+        from .lingbo_va.modeling_lingbo_va import LingBoVAPolicy
+
+        return LingBoVAPolicy
     elif name == "xvla":
         from .xvla.modeling_xvla import XVLAPolicy
 
@@ -216,6 +221,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
+    elif policy_type == "lingbo_va":
+        return LingBoVAConfig(**kwargs)
     elif policy_type == "xvla":
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
@@ -425,6 +432,14 @@ def make_pre_post_processors(
         from .groot.processor_groot import make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, LingBoVAConfig):
+        from .lingbo_va.processor_lingbo_va import make_lingbo_va_pre_post_processors
+
+        processors = make_lingbo_va_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
