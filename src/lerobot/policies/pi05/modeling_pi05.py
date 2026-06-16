@@ -1287,22 +1287,26 @@ class PI05Policy(PreTrainedPolicy):
         if padded_losses.numel() > 0:
             loss_dict["loss_padded_dims"] = padded_losses.mean().item()
 
-        if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
+        if padded_losses.numel() == 0 or self.config.padded_action_loss_weight == 1.0:
             per_sample_loss = losses.mean(dim=(1, 2))
+        else:
+            padded_weight = self.config.padded_action_loss_weight
+            weighted_sum = action_losses.sum(dim=(1, 2)) + padded_weight * padded_losses.sum(dim=(1, 2))
+            weighted_dims = original_action_dim + padded_weight * padded_losses.shape[-1]
+            per_sample_loss = weighted_sum / (losses.shape[1] * weighted_dims)
+
+        if reduction == "none":
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = per_sample_loss.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
-        common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        )
+        common_projections = "action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

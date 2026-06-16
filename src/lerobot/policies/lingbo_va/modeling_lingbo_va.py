@@ -29,7 +29,7 @@ def _is_none_like(value: Any) -> bool:
     if value is None:
         return True
     if isinstance(value, str):
-        return value.strip().lower() in {"", "none", "null", ""}
+        return value.strip().lower() in {"", "none", "null"}
     return False
 
 
@@ -47,6 +47,9 @@ def _dtype_from_config(dtype: str) -> torch.dtype:
 class LingBoVAPolicy(PreTrainedPolicy):
     config_class = LingBoVAConfig
     name = "lingbo_va"
+
+    _ACTION_HEAD_MODULES = ("action_embedder", "action_proj_out", "condition_embedder_action")
+    _VIDEO_HEAD_MODULES = ("patch_embedding_mlp", "condition_embedder", "proj_out")
 
     def __init__(self, config: LingBoVAConfig, **kwargs):
         super().__init__(config)
@@ -72,6 +75,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         object.__setattr__(self, "_server_client", None)
         object.__setattr__(self, "_local_server", None)
         object.__setattr__(self, "_last_prompt", None)
+        object.__setattr__(self, "_forward_calls", 0)
         self._prompt_cache: dict[str, Tensor] = {}
 
     @classmethod
@@ -81,7 +85,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         *,
         config: LingBoVAConfig | None = None,
         **kwargs,
-    ) -> "LingBoVAPolicy":
+    ) -> LingBoVAPolicy:
         path = Path(pretrained_name_or_path).expanduser()
         if path.is_dir():
             if config is None:
@@ -91,6 +95,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
                 config = loaded
             if (path / "transformer").exists():
                 config.transformer_path = path / "transformer"
+            if (path / "transformer_lora").exists():
+                config.use_transformer_lora = True
+                config.transformer_lora_path = path / "transformer_lora"
             stats_path = path / "lingbo_va_action_stats.json"
             policy = cls(config, **kwargs)
             if stats_path.exists():
@@ -101,15 +108,20 @@ class LingBoVAPolicy(PreTrainedPolicy):
 
     def _save_pretrained(self, save_directory: Path) -> None:
         old_transformer_path = self.config.transformer_path
+        old_transformer_lora_path = self.config.transformer_lora_path
         try:
-            if self._transformer is not None:
+            if self._transformer is not None and self.config.use_transformer_lora:
+                self.config.transformer_lora_path = Path("transformer_lora")
+            elif self._transformer is not None:
                 self.config.transformer_path = Path("transformer")
             self.config._save_pretrained(save_directory)
         finally:
             self.config.transformer_path = old_transformer_path
+            self.config.transformer_lora_path = old_transformer_lora_path
 
         if self._transformer is not None:
-            self._transformer.save_pretrained(save_directory / "transformer")
+            subdir = "transformer_lora" if self.config.use_transformer_lora else "transformer"
+            self._transformer.save_pretrained(save_directory / subdir)
         self._save_action_stats(save_directory / "lingbo_va_action_stats.json")
 
     def train(self, mode: bool = True):
@@ -161,7 +173,33 @@ class LingBoVAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> list:
         self._ensure_local_runtime(for_training=True)
         self._apply_training_freeze()
-        return [param for param in self._transformer.parameters() if param.requires_grad]
+        trainable = [
+            (name, param) for name, param in self._transformer.named_parameters() if param.requires_grad
+        ]
+        if not self.config.use_transformer_lora:
+            return [param for _, param in trainable]
+
+        lora_params = [param for name, param in trainable if "lora_" in name]
+        head_params = [param for name, param in trainable if "lora_" not in name]
+        if not lora_params:
+            raise RuntimeError(
+                "use_transformer_lora is enabled, but no trainable LoRA parameters were found."
+            )
+        logging.info(
+            "LingBoVA optimizer groups: heads=%d params at %.2e, LoRA=%d params at %.2e",
+            sum(param.numel() for param in head_params),
+            self.config.optimizer_lr,
+            sum(param.numel() for param in lora_params),
+            self.config.lora_optimizer_lr,
+        )
+        return [
+            {"params": head_params},
+            {
+                "params": lora_params,
+                "lr": self.config.lora_optimizer_lr,
+                "weight_decay": self.config.lora_optimizer_weight_decay,
+            },
+        ]
 
     def reset(self) -> None:
         self._action_queue.clear()
@@ -177,6 +215,17 @@ class LingBoVAPolicy(PreTrainedPolicy):
         latent_pred, action_pred = self._transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self._compute_loss(input_dict, latent_pred, action_pred)
         loss = latent_loss + action_loss
+        self._forward_calls += 1
+        if self._forward_calls == 1 or (
+            self.config.loss_log_freq > 0 and self._forward_calls % self.config.loss_log_freq == 0
+        ):
+            logging.info(
+                "LingBoVA losses at forward %d: video=%.6f action=%.6f total=%.6f",
+                self._forward_calls,
+                latent_loss.detach().item(),
+                action_loss.detach().item(),
+                loss.detach().item(),
+            )
         return loss, {
             "loss_video": float(latent_loss.detach().item()),
             "loss_action": float(action_loss.detach().item()),
@@ -241,14 +290,67 @@ class LingBoVAPolicy(PreTrainedPolicy):
             raise FileNotFoundError(f"LingBoVA transformer path not found: {path}")
         return self._resolve_model_root() / "transformer"
 
+    def _resolve_transformer_lora_path(self) -> Path | None:
+        if self.config.transformer_lora_path is None:
+            return None
+        path = Path(self.config.transformer_lora_path).expanduser()
+        if not path.is_absolute() and self.config.pretrained_path is not None:
+            path = Path(self.config.pretrained_path).expanduser() / path
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"LingBoVA Transformer LoRA path not found: {path}")
+        return path
+
+    def _lora_modules_to_save(self) -> list[str]:
+        modules = list(self._ACTION_HEAD_MODULES)
+        if self.config.train_video_head:
+            modules.extend(self._VIDEO_HEAD_MODULES)
+        return modules
+
+    def _apply_transformer_lora(self, transformer, for_training: bool):
+        from peft import LoraConfig, PeftModel, get_peft_model
+
+        adapter_path = self._resolve_transformer_lora_path()
+        if adapter_path is not None:
+            transformer = PeftModel.from_pretrained(
+                transformer,
+                adapter_path,
+                is_trainable=for_training,
+            )
+            logging.info("Loaded LingBoVA Transformer LoRA from %s", adapter_path)
+            return transformer
+
+        lora_config = LoraConfig(
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            target_modules=list(self.config.lora_target_modules),
+            modules_to_save=self._lora_modules_to_save(),
+        )
+        transformer = get_peft_model(transformer, lora_config)
+        logging.info(
+            "Initialized LingBoVA Transformer LoRA: rank=%d alpha=%d targets=%s",
+            self.config.lora_rank,
+            self.config.lora_alpha,
+            self.config.lora_target_modules,
+        )
+        return transformer
+
     def _ensure_local_runtime(self, for_training: bool) -> None:
         if self._transformer is not None and self._vae is not None and self._text_encoder is not None:
             return
 
         self._install_lingbo_import_path()
         try:
-            from wan_va.modules.utils import WanVAEStreamingWrapper, load_text_encoder, load_tokenizer, load_transformer, load_vae
             from wan_va.distributed.fsdp import apply_ac
+            from wan_va.modules.utils import (
+                WanVAEStreamingWrapper,
+                load_text_encoder,
+                load_tokenizer,
+                load_transformer,
+                load_vae,
+            )
             from wan_va.utils import data_seq_to_patch, get_mesh_id, sample_timestep_id
             from wan_va.utils.scheduler import FlowMatchScheduler
         except ModuleNotFoundError as exc:
@@ -280,6 +382,8 @@ class LingBoVAPolicy(PreTrainedPolicy):
                         logging.warning("LingBoVA gradient checkpointing is unavailable: %s", exc)
                 else:
                     logging.warning("LingBoVA gradient checkpointing is unavailable: %s", exc)
+        if self.config.use_transformer_lora:
+            transformer = self._apply_transformer_lora(transformer, for_training=for_training)
 
         vae = load_vae(str(model_root / "vae"), torch_dtype=dtype, torch_device=vae_device)
         text_encoder = load_text_encoder(
@@ -328,15 +432,25 @@ class LingBoVAPolicy(PreTrainedPolicy):
         if transformer is None:
             return
         transformer.train()
-        if not self.config.train_action_head_only:
+        if self.config.use_transformer_lora:
+            transformer.requires_grad_(False)
+            transformer.set_adapter(transformer.active_adapter)
+        elif not self.config.train_action_head_only:
             transformer.requires_grad_(True)
         else:
             transformer.requires_grad_(False)
-            for name in ("action_embedder", "action_proj_out", "condition_embedder_action"):
+            for name in self._ACTION_HEAD_MODULES:
                 module = getattr(transformer, name, None)
                 if module is not None:
                     module.train()
                     module.requires_grad_(True)
+            if self.config.train_video_head:
+                for name in self._VIDEO_HEAD_MODULES:
+                    module = getattr(transformer, name, None)
+                    if module is not None:
+                        module.train()
+                        module.requires_grad_(True)
+                transformer.scale_shift_table.requires_grad_(True)
         for module in (getattr(self, "_vae", None), getattr(self, "_text_encoder", None)):
             if module is not None and self.config.freeze_vision_text_encoder:
                 module.eval()
@@ -348,7 +462,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
         prompts = self._build_prompts(batch, batch_size=latents.shape[0])
         text_emb = self._encode_prompts(prompts).to(device=latents.device, dtype=latents.dtype)
 
-        latent_dict = self._add_noise(latents, self._train_scheduler_latent, action_mask=None, action_mode=False)
+        latent_dict = self._add_noise(
+            latents, self._train_scheduler_latent, action_mask=None, action_mode=False
+        )
         action_dict = self._add_noise(
             actions,
             self._train_scheduler_action,
@@ -366,10 +482,14 @@ class LingBoVAPolicy(PreTrainedPolicy):
         }
 
     @torch.no_grad()
-    def _add_noise(self, latent: Tensor, train_scheduler: Any, action_mask: Tensor | None, action_mode: bool) -> dict[str, Tensor]:
+    def _add_noise(
+        self, latent: Tensor, train_scheduler: Any, action_mask: Tensor | None, action_mode: bool
+    ) -> dict[str, Tensor]:
         batch_size, _, num_frames, height, width = latent.shape
         sample_timestep_id = self._lingbo_utils["sample_timestep_id"]
-        timestep_ids = sample_timestep_id(batch_size=num_frames, num_train_timesteps=train_scheduler.num_train_timesteps)
+        timestep_ids = sample_timestep_id(
+            batch_size=num_frames, num_train_timesteps=train_scheduler.num_train_timesteps
+        )
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=latent.device)
         noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
@@ -403,7 +523,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
             "grid_id": grid_id,
         }
 
-    def _compute_loss(self, input_dict: dict[str, Any], latent_pred: Tensor, action_pred: Tensor) -> tuple[Tensor, Tensor]:
+    def _compute_loss(
+        self, input_dict: dict[str, Any], latent_pred: Tensor, action_pred: Tensor
+    ) -> tuple[Tensor, Tensor]:
         action_targets = input_dict["action_dict"]["targets"]
         latent_targets = input_dict["latent_dict"]["targets"]
         action_pred = rearrange(action_pred, "b (f n) c -> b c f n 1", f=action_targets.shape[-3])
@@ -454,13 +576,20 @@ class LingBoVAPolicy(PreTrainedPolicy):
         target_vae_device = torch.device(self.config.vae_device or self.config.device)
         if next(self._vae.parameters()).device != target_vae_device:
             self._vae.to(target_vae_device)
-        self._streaming_vae.clear_cache()
         vae_device = next(self._vae.parameters()).device
-        enc = self._encode_vae_chunk(video.to(device=vae_device, dtype=self._vae.dtype))
+        encoded_chunks = []
+        for video_chunk in video.split(self.config.vae_encode_batch_size):
+            self._streaming_vae.clear_cache()
+            encoded_chunks.append(
+                self._encode_vae_chunk(video_chunk.to(device=vae_device, dtype=self._vae.dtype))
+            )
+        enc = torch.cat(encoded_chunks, dim=0)
         mu, _ = torch.chunk(enc, 2, dim=1)
         latents_mean = torch.tensor(self._vae.config.latents_mean, device=mu.device, dtype=torch.float32)
         latents_std = torch.tensor(self._vae.config.latents_std, device=mu.device, dtype=torch.float32)
-        mu = ((mu.float() - latents_mean.view(1, -1, 1, 1, 1)) / latents_std.view(1, -1, 1, 1, 1)).to(mu.dtype)
+        mu = ((mu.float() - latents_mean.view(1, -1, 1, 1, 1)) / latents_std.view(1, -1, 1, 1, 1)).to(
+            mu.dtype
+        )
         _, channels_latent, frames_latent, height_latent, width_latent = mu.shape
         mu = mu.reshape(batch_size, num_cameras, channels_latent, frames_latent, height_latent, width_latent)
         latents = torch.cat([mu[:, idx] for idx in range(num_cameras)], dim=-1)
@@ -470,7 +599,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
                 f"{latents.shape[2]} vs frame_chunk_size={self.config.frame_chunk_size}. "
                 "Check vae_temporal_stride/video_frame_stride/num_frames."
             )
-        latents = latents.to(device=next(self._transformer.parameters()).device, dtype=_dtype_from_config(self.config.dtype))
+        latents = latents.to(
+            device=next(self._transformer.parameters()).device, dtype=_dtype_from_config(self.config.dtype)
+        )
         if self.config.offload_vae_after_encode and target_vae_device.type == "cuda":
             self._vae.to("cpu")
             torch.cuda.empty_cache()
@@ -479,6 +610,8 @@ class LingBoVAPolicy(PreTrainedPolicy):
     def _encode_vae_chunk(self, video: Tensor) -> Tensor:
         try:
             return self._vae.encode(video).latent_dist.parameters
+        except torch.OutOfMemoryError:
+            raise
         except Exception:
             return self._streaming_vae.encode_chunk(video)
 
@@ -521,11 +654,18 @@ class LingBoVAPolicy(PreTrainedPolicy):
             device=action_device,
         )
         if ACTION + "_is_pad" in batch:
-            valid = valid & ~torch.as_tensor(batch[ACTION + "_is_pad"], dtype=torch.bool)[:, : self.config.chunk_size, None]
+            valid = (
+                valid
+                & ~torch.as_tensor(batch[ACTION + "_is_pad"], dtype=torch.bool)[
+                    :, : self.config.chunk_size, None
+                ]
+            )
         channel_mask = torch.zeros(self.config.lingbo_action_dim, dtype=torch.bool, device=action_device)
         channel_mask[self.config.used_action_channel_ids] = True
         valid = valid & channel_mask.view(1, 1, -1)
-        valid = rearrange(valid, "b (f n) c -> b c f n 1", f=self.config.frame_chunk_size, n=self.config.action_per_frame)
+        valid = rearrange(
+            valid, "b (f n) c -> b c f n 1", f=self.config.frame_chunk_size, n=self.config.action_per_frame
+        )
 
         device = next(self._transformer.parameters()).device
         dtype = _dtype_from_config(self.config.dtype)
@@ -555,9 +695,12 @@ class LingBoVAPolicy(PreTrainedPolicy):
             if missing:
                 raise KeyError(f"Configured LingBoVA camera_keys missing from batch: {missing}")
             return list(self.config.camera_keys)
-        candidates = [self.config.front_camera_key, self.config.wrist_camera_key]
-        if all(key in batch for key in candidates):
-            return candidates
+        for candidates in (
+            [self.config.front_camera_key, self.config.right_camera_key],
+            [self.config.front_camera_key, self.config.wrist_camera_key],
+        ):
+            if all(key in batch for key in candidates):
+                return candidates
         visual_keys = [key for key in self.config.image_features if key in batch]
         if not visual_keys:
             raise KeyError("LingBoVA could not find visual observation keys in the batch.")
@@ -588,7 +731,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
         if float(image.detach().amin().cpu()) >= 0.0:
             image = image * 2.0 - 1.0
         if image.shape[1] < self.config.num_frames:
-            raise ValueError(f"LingBoVA needs {self.config.num_frames} observation frames, got {image.shape[1]}.")
+            raise ValueError(
+                f"LingBoVA needs {self.config.num_frames} observation frames, got {image.shape[1]}."
+            )
         return image[:, : self.config.num_frames]
 
     def _as_current_image_uint8(self, value: Any) -> np.ndarray:
@@ -618,7 +763,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         tasks = batch.get(self.config.task_key, self.config.default_task)
         if isinstance(tasks, str):
             task_list = [tasks] * batch_size
-        elif isinstance(tasks, (list, tuple)):
+        elif isinstance(tasks, list | tuple):
             task_list = list(tasks)
             if len(task_list) == 1 and batch_size > 1:
                 task_list = task_list * batch_size
@@ -630,14 +775,14 @@ class LingBoVAPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def _encode_prompts(self, prompts: list[str]) -> Tensor:
-        uncached = [prompt for prompt in prompts if prompt not in self._prompt_cache]
+        uncached = list(dict.fromkeys(prompt for prompt in prompts if prompt not in self._prompt_cache))
         if uncached:
             from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 
             cleaned = [prompt_clean(prompt) for prompt in uncached]
             inputs = self._tokenizer(
                 cleaned,
-                padding="max_length",
+                padding=True,
                 max_length=512,
                 truncation=True,
                 add_special_tokens=True,
@@ -654,11 +799,11 @@ class LingBoVAPolicy(PreTrainedPolicy):
             ).last_hidden_state
             seq_lens = inputs.attention_mask.gt(0).sum(dim=1).long()
             padded = []
-            for emb, valid in zip(embeds, seq_lens):
+            for emb, valid in zip(embeds, seq_lens, strict=False):
                 cur = emb[:valid]
                 cur = torch.cat([cur, cur.new_zeros(512 - cur.shape[0], cur.shape[1])], dim=0)
                 padded.append(cur.detach().cpu())
-            for prompt, emb in zip(uncached, padded):
+            for prompt, emb in zip(uncached, padded, strict=False):
                 self._prompt_cache[prompt] = emb
             if self.config.offload_text_encoder_after_encode and target_text_device.type == "cuda":
                 self._text_encoder.to("cpu")
@@ -716,7 +861,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         server_keys = self._server_camera_keys(camera_keys)
         obs = {
             out_key: self._as_current_image_uint8(batch[in_key])
-            for in_key, out_key in zip(camera_keys, server_keys)
+            for in_key, out_key in zip(camera_keys, server_keys, strict=False)
         }
         payload = {
             "obs": [obs],
@@ -761,8 +906,13 @@ class LingBoVAPolicy(PreTrainedPolicy):
             arr = np.transpose(arr, (1, 2, 0)).reshape(-1, arr.shape[0])
         elif arr.ndim != 2:
             raise ValueError(f"Unexpected LingBoVA action response shape: {arr.shape}")
-        if arr.shape[-1] != self.config.action_dim:
-            arr = arr[:, : self.config.action_dim]
+        if arr.shape[-1] == self.config.lingbo_action_dim:
+            arr = arr[:, self.config.used_action_channel_ids]
+        elif arr.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                "Unexpected LingBoVA action channel count: "
+                f"{arr.shape[-1]} (expected {self.config.action_dim} or {self.config.lingbo_action_dim})."
+            )
         return torch.from_numpy(arr).unsqueeze(0)
 
     def _ensure_server_client(self):
@@ -813,11 +963,15 @@ class LingBoVAPolicy(PreTrainedPolicy):
         cfg.height, cfg.width = self.config.image_size
         cfg.action_dim = int(self.config.lingbo_action_dim)
         cfg.action_per_frame = int(self.config.action_per_frame)
-        cfg.obs_cam_keys = self._server_camera_keys(self.config.camera_keys or [self.config.front_camera_key, self.config.wrist_camera_key])
+        cfg.obs_cam_keys = self._server_camera_keys(
+            self.config.camera_keys or [self.config.front_camera_key, self.config.right_camera_key]
+        )
         cfg.guidance_scale = float(self.config.video_guidance_scale)
         cfg.action_guidance_scale = float(self.config.action_guidance_scale)
         cfg.num_inference_steps = int(self.config.video_inference_steps or 5)
-        cfg.video_exec_step = int(self.config.video_exec_step if self.config.video_exec_step is not None else -1)
+        cfg.video_exec_step = int(
+            self.config.video_exec_step if self.config.video_exec_step is not None else -1
+        )
         cfg.action_num_inference_steps = int(self.config.action_inference_steps or 10)
         cfg.used_action_channel_ids = list(self.config.used_action_channel_ids)
         inverse = self._inverse_used_action_channel_ids()
@@ -858,7 +1012,7 @@ def _pack_array(obj):
         }
     if isinstance(obj, dict):
         return {key: _pack_array(value) for key, value in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return [_pack_array(value) for value in obj]
     return obj
 

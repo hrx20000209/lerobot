@@ -66,6 +66,10 @@ class ProcessorStepRegistry:
     """
 
     _registry: dict[str, type] = {}
+    _aliases: dict[str, str] = {
+        # PI0/PI05 checkpoints saved before the relative-action processor rename.
+        "delta_actions_processor": "relative_actions_processor",
+    }
 
     @classmethod
     def register(cls, name: str | None = None):
@@ -111,6 +115,7 @@ class ProcessorStepRegistry:
         Raises:
             KeyError: If the name is not found in the registry.
         """
+        name = cls._aliases.get(name, name)
         if name not in cls._registry:
             available = list(cls._registry.keys())
             raise KeyError(

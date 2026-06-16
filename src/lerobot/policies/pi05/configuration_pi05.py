@@ -86,6 +86,9 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # PI0.5 pads short action vectors to max_action_dim. Keep padded dimensions
+    # supervised, but optionally reduce their contribution to the scalar loss.
+    padded_action_loss_weight: float = 1.0
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -120,6 +123,9 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if self.padded_action_loss_weight < 0:
+            raise ValueError("padded_action_loss_weight must be non-negative")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

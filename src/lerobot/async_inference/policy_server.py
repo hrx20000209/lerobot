@@ -30,6 +30,7 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
@@ -38,6 +39,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
@@ -148,11 +150,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
-        policy_class = get_policy_class(self.policy_type)
-
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
+        self.policy = self._load_policy(policy_specs)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -175,6 +174,49 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
+
+    def _load_policy(self, policy_specs: RemotePolicyConfig) -> torch.nn.Module:
+        policy_class = get_policy_class(policy_specs.policy_type)
+        config = PreTrainedConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+        config.device = policy_specs.device
+
+        checkpoint_path = Path(policy_specs.pretrained_name_or_path)
+        local_adapter_checkpoint = (
+            checkpoint_path.is_dir() and (checkpoint_path / "adapter_config.json").exists()
+        )
+        local_model_file = checkpoint_path.is_dir() and (
+            checkpoint_path / "model.safetensors"
+        ).exists()
+        is_peft_checkpoint = getattr(config, "use_peft", False) and (
+            local_adapter_checkpoint or not local_model_file
+        )
+        if is_peft_checkpoint:
+            from peft import PeftConfig, PeftModel
+
+            peft_config = PeftConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+            base_model_name_or_path = peft_config.base_model_name_or_path
+            if not base_model_name_or_path:
+                raise ValueError(
+                    "PEFT adapter config does not define base_model_name_or_path; cannot load async policy."
+                )
+
+            self.logger.info(
+                "Loading PEFT policy adapter for async inference | "
+                f"Base: {base_model_name_or_path} | Adapter: {policy_specs.pretrained_name_or_path}"
+            )
+            policy = policy_class.from_pretrained(base_model_name_or_path, config=config)
+            policy = PeftModel.from_pretrained(
+                policy,
+                policy_specs.pretrained_name_or_path,
+                config=peft_config,
+                is_trainable=False,
+            )
+        else:
+            policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path, config=config)
+
+        policy.to(policy_specs.device)
+        policy.eval()
+        return policy
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""

@@ -21,7 +21,7 @@ class LingBoVAConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 32
     n_action_steps: int = 8
-    num_frames: int = 33
+    num_frames: int = 25
     frame_chunk_size: int = 4
     action_per_frame: int = 8
     vae_temporal_stride: int = 4
@@ -33,11 +33,14 @@ class LingBoVAConfig(PreTrainedConfig):
     auto_configure_dims: bool = True
 
     image_size: tuple[int, int] = (256, 256)
-    camera_keys: list[str] | None = None
+    camera_keys: list[str] | None = field(
+        default_factory=lambda: [f"{OBS_IMAGES}.front", f"{OBS_IMAGES}.right"]
+    )
     server_camera_keys: list[str] | None = None
     top_camera_key: str = f"{OBS_IMAGES}.top"
     wrist_camera_key: str = f"{OBS_IMAGES}.wrist"
     front_camera_key: str = f"{OBS_IMAGES}.front"
+    right_camera_key: str = f"{OBS_IMAGES}.right"
     state_key: str = OBS_STATE
     task_key: str = "task"
 
@@ -47,7 +50,7 @@ class LingBoVAConfig(PreTrainedConfig):
     lingbo_root: Path | None = Path("/home/rxhuang/Projects/lingbot-va")
     model_root: Path | None = Path("/home/rxhuang/Projects/models/lingbot-va-posttrain-robotwin")
     transformer_path: Path | None = None
-    va_config_name: str = "demo"
+    va_config_name: str = "so101"
     env_type: str = "none"
     attn_window: int = 30
     save_root: Path = Path("./lingbo_va_runtime")
@@ -67,8 +70,18 @@ class LingBoVAConfig(PreTrainedConfig):
     return_server_profile: bool = False
 
     train_action_head_only: bool = True
+    train_video_head: bool = False
+    use_transformer_lora: bool = False
+    transformer_lora_path: Path | None = None
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.0
+    lora_target_modules: list[str] = field(default_factory=lambda: ["to_q", "to_v"])
+    lora_optimizer_lr: float = 1e-4
+    lora_optimizer_weight_decay: float = 0.0
     freeze_vision_text_encoder: bool = True
     vae_device: str | None = None
+    vae_encode_batch_size: int = 1
     text_encoder_device: str | None = "cpu"
     transformer_device: str | None = None
     offload_vae_after_encode: bool = True
@@ -78,6 +91,7 @@ class LingBoVAConfig(PreTrainedConfig):
     norm_default_mode: str = "q01/q99"
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-1
+    loss_log_freq: int = 20
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -105,6 +119,22 @@ class LingBoVAConfig(PreTrainedConfig):
             self.video_frame_stride = max(1, self.action_per_frame // self.vae_temporal_stride)
         if self.video_frame_stride <= 0:
             raise ValueError("video_frame_stride must be positive.")
+        if self.vae_encode_batch_size <= 0:
+            raise ValueError("vae_encode_batch_size must be positive.")
+        if self.loss_log_freq < 0:
+            raise ValueError("loss_log_freq cannot be negative.")
+        if self.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive.")
+        if self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be positive.")
+        if not 0.0 <= self.lora_dropout < 1.0:
+            raise ValueError("lora_dropout must be in [0, 1).")
+        if self.lora_optimizer_lr <= 0:
+            raise ValueError("lora_optimizer_lr must be positive.")
+        if self.lora_optimizer_weight_decay < 0:
+            raise ValueError("lora_optimizer_weight_decay cannot be negative.")
+        if self.use_transformer_lora and not self.lora_target_modules:
+            raise ValueError("lora_target_modules cannot be empty when use_transformer_lora is enabled.")
         if self.n_action_steps > self.chunk_size:
             raise ValueError("n_action_steps cannot be greater than chunk_size.")
         required_frames = (self.frame_chunk_size - 1) * self.video_frame_stride * self.vae_temporal_stride + 1
@@ -126,11 +156,13 @@ class LingBoVAConfig(PreTrainedConfig):
 
     def validate_features(self) -> None:
         if not self.input_features:
+            camera_keys = self.camera_keys or [self.front_camera_key, self.right_camera_key]
             self.input_features = {
-                self.top_camera_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
-                self.wrist_camera_key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
-                self.state_key: PolicyFeature(type=FeatureType.STATE, shape=(self.action_dim,)),
+                key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)) for key in camera_keys
             }
+            self.input_features[self.state_key] = PolicyFeature(
+                type=FeatureType.STATE, shape=(self.action_dim,)
+            )
 
         if not self.output_features:
             self.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))}
@@ -141,6 +173,8 @@ class LingBoVAConfig(PreTrainedConfig):
         if self.used_action_channel_ids is None:
             self.used_action_channel_ids = list(range(self.action_dim))
 
+        if self.camera_keys is not None and len(set(self.camera_keys)) != len(self.camera_keys):
+            raise ValueError("camera_keys must not contain duplicates.")
         if len(self.used_action_channel_ids) != self.action_dim:
             raise ValueError(
                 "used_action_channel_ids length must match dataset action_dim, got "

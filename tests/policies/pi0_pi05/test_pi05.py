@@ -21,6 +21,8 @@ import torch
 
 pytest.importorskip("transformers")
 
+from lerobot.configs.default import DatasetConfig  # noqa: E402
+from lerobot.configs.train import TrainPipelineConfig  # noqa: E402
 from lerobot.policies.factory import make_policy_config  # noqa: E402
 from lerobot.policies.pi05 import (  # noqa: E402
     PI05Config,
@@ -29,6 +31,35 @@ from lerobot.policies.pi05 import (  # noqa: E402
 )
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
+
+def test_expert_only_training_requires_pretrained_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr("lerobot.configs.train.parser.get_path_arg", lambda _: None)
+    config = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="test/dataset"),
+        policy=PI05Config(train_expert_only=True),
+        output_dir=tmp_path / "output",
+    )
+
+    with pytest.raises(ValueError, match="expert-only training requires a pretrained checkpoint"):
+        config.validate()
+
+
+def test_default_peft_targets_use_pi05_projection_names():
+    policy = object.__new__(PI05Policy)
+    torch.nn.Module.__init__(policy)
+
+    targets = policy._get_default_peft_targets()["target_modules"]
+
+    assert "time_mlp_in" in targets
+    assert "time_mlp_out" in targets
+    assert "state_proj" not in targets
+    assert "action_time_mlp" not in targets
+
+
+def test_padded_action_loss_weight_must_be_non_negative():
+    with pytest.raises(ValueError, match="must be non-negative"):
+        PI05Config(padded_action_loss_weight=-0.1)
 
 
 @require_cuda

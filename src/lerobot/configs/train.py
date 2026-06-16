@@ -177,6 +177,18 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if (
+            not self.is_reward_model_training
+            and active_cfg.type == "pi05"
+            and getattr(active_cfg, "train_expert_only", False)
+            and active_cfg.pretrained_path is None
+        ):
+            raise ValueError(
+                "PI0.5 expert-only training requires a pretrained checkpoint. "
+                "Set `--policy.pretrained_path=lerobot/pi05_base`; otherwise the randomly initialized VLM "
+                "is frozen and the action expert cannot learn meaningful visual conditioning."
+            )
+
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

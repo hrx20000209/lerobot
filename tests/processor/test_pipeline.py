@@ -38,8 +38,13 @@ from lerobot.processor import (
     TransitionKey,
 )
 from lerobot.processor.converters import create_transition, identity_transition
+from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STATE, REWARD, TRUNCATED
 from tests.conftest import assert_contract_is_typed
+
+
+def test_legacy_delta_actions_processor_registry_alias():
+    assert ProcessorStepRegistry.get("delta_actions_processor") is RelativeActionsProcessorStep
 
 
 @dataclass
