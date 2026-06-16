@@ -63,8 +63,6 @@ def evaluate(run_dir: Path, checkpoint: Path, eval_root: Path, gpu: str, episode
         str(episode),
         "--device",
         "cuda",
-        "--execution-horizon",
-        "10",
         "--output-dir",
         str(output_dir),
     ]

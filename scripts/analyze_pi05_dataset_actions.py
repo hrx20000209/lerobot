@@ -27,7 +27,7 @@ DEFAULT_JOINT_NAMES = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay a LeRobot episode through a PI05 checkpoint and compare predicted actions."
+        description="Replay a LeRobot episode through a chunked policy checkpoint and compare predicted actions."
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument("--policy-label", default=None)
     parser.add_argument(
         "--execution-horizon",
         type=int,
@@ -43,6 +44,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of predicted actions executed before replanning. Defaults to policy.n_action_steps.",
     )
     parser.add_argument("--num-inference-steps", type=int, default=None)
+    parser.add_argument("--num-inference-timesteps", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("output_lerobot_eval/pi05_dataset"))
     return parser.parse_args()
 
@@ -78,6 +80,45 @@ def make_noise(policy, seed: int) -> torch.Tensor:
     )
 
 
+def read_saved_rename_map(checkpoint: Path) -> dict[str, str]:
+    preprocessor_path = checkpoint / "policy_preprocessor.json"
+    if not preprocessor_path.exists():
+        return {}
+
+    data = json.loads(preprocessor_path.read_text())
+    for step in data.get("steps", []):
+        if step.get("registry_name") == "rename_observations_processor":
+            return dict(step.get("config", {}).get("rename_map", {}))
+    return {}
+
+
+def make_observation(sample: dict) -> dict:
+    observation = {
+        key: value
+        for key, value in sample.items()
+        if key.startswith("observation.") or key in {"task", "task_index"}
+    }
+    if "task" in sample:
+        observation["task"] = sample["task"]
+    return observation
+
+
+def make_prediction_kwargs(
+    policy,
+    seed: int,
+    anchor_idx: int,
+    num_inference_steps: int | None,
+) -> dict:
+    kwargs = {}
+    # PI0/PI05 expose stochastic flow sampling through an optional noise tensor and `num_steps`.
+    # Other policies, such as VLA-JEPA, own their sampling loop and should be called without these extras.
+    if hasattr(policy.config, "max_action_dim"):
+        kwargs["noise"] = make_noise(policy, seed + anchor_idx)
+        if num_inference_steps is not None:
+            kwargs["num_steps"] = num_inference_steps
+    return kwargs
+
+
 def predict_chunked_episode(
     dataset: LeRobotDataset,
     policy,
@@ -96,13 +137,9 @@ def predict_chunked_episode(
 
     for anchor_idx, anchor in enumerate(anchors):
         sample = dataset[anchor]
-        observation = {key: sample[key] for key in policy.config.input_features if key in sample}
-        observation["task"] = sample["task"]
+        observation = make_observation(sample)
         processed = preprocessor(observation)
-        noise = make_noise(policy, seed + anchor_idx)
-        kwargs = {"noise": noise}
-        if num_inference_steps is not None:
-            kwargs["num_steps"] = num_inference_steps
+        kwargs = make_prediction_kwargs(policy, seed, anchor_idx, num_inference_steps)
 
         with torch.inference_mode():
             normalized_chunk = policy.predict_action_chunk(processed, **kwargs)
@@ -200,6 +237,7 @@ def add_chunk_boundaries(axis, timestamps: np.ndarray, anchors: list[int]) -> No
 
 def plot_overview(
     output_path: Path,
+    policy_label: str,
     timestamps: np.ndarray,
     predictions: np.ndarray,
     ground_truth: np.ndarray,
@@ -238,7 +276,8 @@ def plot_overview(
         axis.set_ylabel("joint position")
         axis.legend(fontsize=8, ncol=2)
     figure.suptitle(
-        "PI05 dataset replay: prediction vs GT action vs observation.state\nred lines = replanning boundaries"
+        f"{policy_label} dataset replay: prediction vs GT action vs observation.state\n"
+        "red lines = replanning boundaries"
     )
     figure.tight_layout()
     figure.savefig(output_path, dpi=180)
@@ -247,6 +286,7 @@ def plot_overview(
 
 def plot_per_joint(
     output_path: Path,
+    policy_label: str,
     timestamps: np.ndarray,
     predictions: np.ndarray,
     ground_truth: np.ndarray,
@@ -256,7 +296,7 @@ def plot_per_joint(
 ) -> None:
     figure, axes = plt.subplots(3, 2, figsize=(16, 12), sharex=True)
     for joint_idx, axis in enumerate(axes.flat):
-        axis.plot(timestamps, predictions[:, joint_idx], label="PI05 prediction", linewidth=1.8)
+        axis.plot(timestamps, predictions[:, joint_idx], label=f"{policy_label} prediction", linewidth=1.8)
         axis.plot(timestamps, ground_truth[:, joint_idx], label="GT action", linestyle="--")
         axis.plot(timestamps, states[:, joint_idx], label="observation.state", linestyle=":")
         add_chunk_boundaries(axis, timestamps, anchors)
@@ -277,7 +317,7 @@ def plot_horizon_error(output_path: Path, horizon_mae: np.ndarray, joint_names: 
         axis.plot(horizons, horizon_mae[:, joint_idx], label=name)
     axis.set_xlabel("predicted action horizon")
     axis.set_ylabel("mean absolute error")
-    axis.set_title("PI05 action error by position inside each predicted chunk")
+    axis.set_title("Action error by position inside each predicted chunk")
     axis.grid(alpha=0.25)
     axis.legend(ncol=2)
     figure.tight_layout()
@@ -297,12 +337,17 @@ def main() -> None:
     config.pretrained_path = checkpoint
     if args.num_inference_steps is not None:
         config.num_inference_steps = args.num_inference_steps
+    if args.num_inference_timesteps is not None:
+        config.num_inference_timesteps = args.num_inference_timesteps
 
-    policy = make_policy(config, ds_meta=dataset.meta)
+    saved_rename_map = read_saved_rename_map(checkpoint)
+    policy = make_policy(config, ds_meta=dataset.meta, rename_map=saved_rename_map or None)
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(
         config,
         pretrained_path=str(checkpoint),
+        preprocessor_overrides={"device_processor": {"device": args.device}},
+        postprocessor_overrides={"device_processor": {"device": args.device}},
     )
 
     execution_horizon = args.execution_horizon or config.n_action_steps
@@ -310,9 +355,10 @@ def main() -> None:
         raise ValueError("execution_horizon cannot exceed policy.chunk_size")
 
     ground_truth, states, timestamps = raw_episode_arrays(dataset)
-    joint_names = list(config.action_feature_names or DEFAULT_JOINT_NAMES)
+    joint_names = list(getattr(config, "action_feature_names", None) or DEFAULT_JOINT_NAMES)
     if len(joint_names) != ground_truth.shape[-1]:
         joint_names = DEFAULT_JOINT_NAMES[: ground_truth.shape[-1]]
+    policy_label = args.policy_label or config.type
 
     predictions, anchors, horizon_mae = predict_chunked_episode(
         dataset=dataset,
@@ -332,8 +378,10 @@ def main() -> None:
             "fps": dataset.meta.fps,
             "execution_horizon": execution_horizon,
             "chunk_size": config.chunk_size,
-            "num_inference_steps": config.num_inference_steps,
+            "num_inference_steps": getattr(config, "num_inference_steps", None),
+            "num_inference_timesteps": getattr(config, "num_inference_timesteps", None),
             "seed": args.seed,
+            "rename_map": saved_rename_map,
             "first_action_mae": horizon_mae[0].tolist(),
         }
     )
@@ -351,6 +399,7 @@ def main() -> None:
     (output_dir / f"{prefix}_metrics.json").write_text(json.dumps(metrics, indent=2))
     plot_overview(
         output_dir / f"{prefix}_overview.png",
+        policy_label,
         timestamps,
         predictions,
         ground_truth,
@@ -360,6 +409,7 @@ def main() -> None:
     )
     plot_per_joint(
         output_dir / f"{prefix}_per_joint.png",
+        policy_label,
         timestamps,
         predictions,
         ground_truth,
