@@ -289,12 +289,30 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             with self._predicted_timesteps_lock:
                 self._predicted_timesteps.add(obs.get_timestep())
 
+            inference_start_time = time.time()
             start_time = time.perf_counter()
             action_chunk, predict_timing = self._predict_action_chunk(obs)
+            inference_end_time = time.time()
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
             if action_chunk:
+                server_timeline = {
+                    "observation_timestep": obs.get_timestep(),
+                    "observation_timestamp": obs.get_timestamp(),
+                    "inference_start_time": inference_start_time,
+                    "inference_end_time": inference_end_time,
+                }
+                for timed_action in action_chunk:
+                    timed_action.metadata.update(
+                        {
+                            "source_observation_timestep": obs.get_timestep(),
+                            "source_observation_timestamp": obs.get_timestamp(),
+                            "inference_start_time": inference_start_time,
+                            "inference_end_time": inference_end_time,
+                            "server_timeline": server_timeline,
+                        }
+                    )
                 action_chunk[0].metadata["server_timestamp"] = time.time()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
             serialize_time = time.perf_counter() - start_time
@@ -324,6 +342,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 sleep_ms=sleep_time * 1000,
                 total_ms=(time.perf_counter() - getactions_starts) * 1000,
                 **predict_timing,
+            )
+            self.latency_recorder.record(
+                "timeline_vla_inference",
+                timestep=obs.get_timestep(),
+                observation_time=obs.get_timestamp(),
+                start_time=inference_start_time,
+                end_time=inference_end_time,
+                first_timestep=action_chunk[0].get_timestep() if action_chunk else -1,
+                last_timestep=action_chunk[-1].get_timestep() if action_chunk else -1,
+                actions_count=len(action_chunk),
             )
 
             time.sleep(sleep_time)  # sleep controls inference latency

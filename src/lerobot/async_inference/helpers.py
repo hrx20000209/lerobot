@@ -16,6 +16,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,9 +64,9 @@ class LatencyRecorder:
         self._lock = threading.RLock()
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.path = self.log_dir / f"{name}_latency_{timestamp}.jsonl"
-        self.summary_path = self.log_dir / f"{name}_latency_summary_{timestamp}.json"
+        self.run_id = time.strftime("%Y%m%d_%H%M%S")
+        self.path = self.log_dir / f"{name}_latency_{self.run_id}.jsonl"
+        self.summary_path = self.log_dir / f"{name}_latency_summary_{self.run_id}.json"
         self._file = self.path.open("a", encoding="utf-8") if enabled else None
 
     def _sync_cuda(self, device: str | torch.device | None = None) -> None:
@@ -104,7 +105,30 @@ class LatencyRecorder:
 
     @staticmethod
     def _is_summary_number(key: str, value: Any) -> bool:
-        if key in {"time", "timestamp", "timestep", "first_timestep", "last_timestep"}:
+        time_like_keys = {
+            "time",
+            "timestamp",
+            "start_time",
+            "end_time",
+            "capture_start_time",
+            "capture_end_time",
+            "observation_time",
+            "execution_start_time",
+            "execution_end_time",
+            "inference_start_time",
+            "inference_end_time",
+            "received_time",
+            "latest_action_time",
+            "source_observation_timestamp",
+        }
+        step_like_keys = {
+            "timestep",
+            "first_timestep",
+            "last_timestep",
+            "latest_action",
+            "source_observation_timestep",
+        }
+        if key in time_like_keys or key in step_like_keys or key.endswith("_timestamp"):
             return False
         return isinstance(value, int | float) and not isinstance(value, bool)
 
@@ -181,6 +205,83 @@ def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
 
 def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
+
+
+def _safe_filename_fragment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "image"
+
+
+def _image_array_or_none(value: Any):
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+    elif isinstance(value, np.ndarray):
+        array = value
+    else:
+        return None
+
+    if array.ndim != 3:
+        return None
+
+    if array.shape[0] in {1, 3, 4} and array.shape[-1] not in {1, 3, 4}:
+        array = np.moveaxis(array, 0, -1)
+
+    if array.shape[-1] not in {1, 3, 4}:
+        return None
+
+    if array.dtype.kind == "f" and array.size > 0 and array.max() <= 1.0:
+        array = np.clip(array, 0.0, 1.0) * 255.0
+    else:
+        array = np.clip(array, 0, 255)
+    return array.astype(np.uint8)
+
+
+def save_observation_images(
+    raw_observation: RawObservation,
+    output_dir: str | Path,
+    timestep: int,
+    mode: str | None = None,
+    key_frame: bool = False,
+) -> list[str]:
+    """Optionally persist raw observation images for timeline inspection.
+
+    mode:
+        off/empty: do not save images
+        key: save only key frames, currently observations marked must_go
+        all/true/1: save every observation with image-like arrays
+    """
+    save_mode = (mode or "").strip().lower()
+    if save_mode in {"", "0", "false", "off", "none", "no"}:
+        return []
+    if save_mode == "key" and not key_frame:
+        return []
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths = []
+    for key, value in raw_observation.items():
+        array = _image_array_or_none(value)
+        if array is None:
+            continue
+
+        filename = f"obs_{timestep:06d}_{_safe_filename_fragment(str(key))}.jpg"
+        path = output_dir / filename
+        if array.shape[-1] == 1:
+            array = array[..., 0]
+        Image.fromarray(array).save(path, quality=90)
+        image_paths.append(str(path))
+
+    return image_paths
 
 
 def resize_robot_observation_image(image: torch.tensor, resize_dims: tuple[int, int, int]) -> torch.tensor:

@@ -34,6 +34,7 @@ python src/lerobot/async_inference/robot_client.py \
 """
 
 import logging
+import os
 import pickle  # nosec
 import threading
 import time
@@ -77,6 +78,7 @@ from .helpers import (
     TimedObservation,
     get_logger,
     map_robot_keys_to_lerobot_features,
+    save_observation_images,
     visualize_action_queue_size,
 )
 
@@ -117,10 +119,15 @@ class RobotClient:
         self.shutdown_event = threading.Event()
         self._stopped = False
         self.latency_recorder = LatencyRecorder("robot_client")
+        self.timeline_image_mode = os.getenv("LEROBOT_TIMELINE_SAVE_IMAGES", "")
+        self.timeline_image_dir = (
+            self.latency_recorder.log_dir / f"robot_client_observation_images_{self.latency_recorder.run_id}"
+        )
 
         # Initialize client side variables
         self.latest_action_lock = threading.Lock()
         self.latest_action = -1
+        self.latest_action_wall_time = None
         self.action_chunk_size = -1
 
         self._chunk_size_threshold = config.chunk_size_threshold
@@ -284,6 +291,7 @@ class RobotClient:
                     action=aggregate_fn(
                         current_action_queue[new_action.get_timestep()], new_action.get_action()
                     ),
+                    metadata=dict(new_action.get_metadata()),
                 )
             )
 
@@ -352,6 +360,26 @@ class RobotClient:
                         last_timestep=last_action_timestep,
                         **server_latency,
                     )
+                if timed_actions:
+                    metadata = timed_actions[0].get_metadata()
+                    server_timeline = metadata.get("server_timeline", {}) if isinstance(metadata, dict) else {}
+                    inference_start_time = server_timeline.get("inference_start_time")
+                    inference_end_time = server_timeline.get("inference_end_time")
+                    if isinstance(inference_start_time, int | float) and isinstance(
+                        inference_end_time, int | float
+                    ):
+                        self.latency_recorder.record(
+                            "timeline_vla_inference",
+                            timestep=server_timeline.get("observation_timestep", first_action_timestep),
+                            observation_time=server_timeline.get("observation_timestamp"),
+                            start_time=inference_start_time,
+                            end_time=inference_end_time,
+                            first_timestep=first_action_timestep,
+                            last_timestep=last_action_timestep,
+                            actions_count=len(timed_actions),
+                            received_time=receive_time,
+                            server_to_client_ms=server_to_client_latency,
+                        )
 
                 # Calculate network latency if we have matching observations
                 if len(timed_actions) > 0 and verbose:
@@ -437,13 +465,31 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
+        execution_start_time = time.time()
         send_start = time.perf_counter()
         _performed_action = self.robot.send_action(
             self._action_tensor_to_action_dict(timed_action.get_action())
         )
+        execution_end_time = time.time()
         send_action_time = time.perf_counter() - send_start
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+            self.latest_action_wall_time = execution_end_time
+        action_metadata = timed_action.get_metadata()
+        source_observation_timestamp = None
+        source_observation_timestep = None
+        inference_start_time = None
+        inference_end_time = None
+        if isinstance(action_metadata, dict):
+            source_observation_timestamp = action_metadata.get("source_observation_timestamp")
+            source_observation_timestep = action_metadata.get("source_observation_timestep")
+            inference_start_time = action_metadata.get("inference_start_time")
+            inference_end_time = action_metadata.get("inference_end_time")
+        source_observation_age_ms = (
+            (execution_start_time - source_observation_timestamp) * 1000
+            if isinstance(source_observation_timestamp, int | float)
+            else None
+        )
         self.latency_recorder.record(
             "client_execute_action",
             timestep=timed_action.get_timestep(),
@@ -451,6 +497,18 @@ class RobotClient:
             robot_send_action_ms=send_action_time * 1000,
             action_age_ms=(time.time() - timed_action.get_timestamp()) * 1000,
             total_ms=(get_end + send_action_time) * 1000,
+        )
+        self.latency_recorder.record(
+            "timeline_action",
+            timestep=timed_action.get_timestep(),
+            start_time=execution_start_time,
+            end_time=execution_end_time,
+            action_timestamp=timed_action.get_timestamp(),
+            source_observation_timestamp=source_observation_timestamp,
+            source_observation_timestep=source_observation_timestep,
+            source_observation_age_ms=source_observation_age_ms,
+            inference_start_time=inference_start_time,
+            inference_end_time=inference_end_time,
         )
 
         if verbose:
@@ -478,12 +536,14 @@ class RobotClient:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
+            capture_start_time = time.time()
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
+                latest_action_wall_time = self.latest_action_wall_time
 
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
@@ -492,12 +552,20 @@ class RobotClient:
             )
 
             obs_capture_time = time.perf_counter() - start_time
+            capture_end_time = observation.get_timestamp()
 
             # If there are no actions left in the queue, the observation must go through processing!
             with self.action_queue_lock:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
 
+            image_paths = save_observation_images(
+                raw_observation,
+                self.timeline_image_dir,
+                observation.get_timestep(),
+                mode=self.timeline_image_mode,
+                key_frame=observation.must_go,
+            )
             _ = self.send_observation(observation)
             self.latency_recorder.record(
                 "client_capture_observation",
@@ -505,6 +573,24 @@ class RobotClient:
                 capture_ms=obs_capture_time * 1000,
                 queue_size=current_queue_size,
                 must_go=int(observation.must_go),
+            )
+            state_lag_ms = (
+                (capture_end_time - latest_action_wall_time) * 1000
+                if isinstance(latest_action_wall_time, int | float)
+                else None
+            )
+            self.latency_recorder.record(
+                "timeline_observation",
+                timestep=observation.get_timestep(),
+                start_time=capture_start_time,
+                end_time=capture_end_time,
+                observation_time=observation.get_timestamp(),
+                latest_action=latest_action,
+                latest_action_time=latest_action_wall_time,
+                state_lag_ms=state_lag_ms,
+                queue_size=current_queue_size,
+                must_go=int(observation.must_go),
+                image_paths=image_paths,
             )
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
