@@ -529,7 +529,11 @@ class RobotClient:
             return raw_observation
 
         except Exception as e:
-            self.logger.error(f"Error in observation sender: {e}")
+            # Observation capture failures usually mean the robot or a camera is no longer providing
+            # trustworthy state. Stop the async client immediately instead of continuing to execute
+            # queued actions from stale observations.
+            self.shutdown_event.set()
+            self.logger.exception("Fatal error in observation sender; stopping robot client: %s", e)
 
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""

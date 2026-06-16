@@ -176,7 +176,17 @@ class OpenCVCamera(Camera):
                 if self.latest_frame is None:
                     raise ConnectionError(f"{self} failed to capture frames during warmup.")
 
-        logger.info(f"{self} connected.")
+        if self.videocapture is not None:
+            fourcc_code = int(self.videocapture.get(cv2.CAP_PROP_FOURCC))
+            actual_fourcc = "".join(chr((fourcc_code >> 8 * i) & 0xFF) for i in range(4))
+            actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+            actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
+            logger.info(
+                f"{self} connected | backend={self.videocapture.getBackendName()} | "
+                f"fourcc={actual_fourcc!r} | width={actual_width} | height={actual_height} | "
+                f"fps={actual_fps:.3f}"
+            )
 
     @check_if_not_connected
     def _configure_capture_settings(self) -> None:
