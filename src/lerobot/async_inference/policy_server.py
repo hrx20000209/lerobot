@@ -50,7 +50,7 @@ from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
-from .constants import SUPPORTED_POLICIES
+from .constants import SUPPORTED_POLICIES, normalize_policy_type
 from .helpers import (
     FPSTracker,
     LatencyRecorder,
@@ -130,6 +130,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         if not isinstance(policy_specs, RemotePolicyConfig):
             raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
+
+        # Normalize CLI aliases before validating and loading. The policy registry uses
+        # Python module names such as "vla_jepa", but users may pass "vla-jepa".
+        policy_specs.policy_type = normalize_policy_type(policy_specs.policy_type)
 
         if policy_specs.policy_type not in SUPPORTED_POLICIES:
             raise ValueError(

@@ -66,6 +66,16 @@ from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
 
 
+POLICY_TYPE_ALIASES = {
+    "vla-jepa": "vla_jepa",
+}
+
+
+def normalize_policy_type(policy_type: str) -> str:
+    """Return the canonical policy registry name for a user-supplied policy type."""
+    return POLICY_TYPE_ALIASES.get(policy_type, policy_type)
+
+
 def _reconnect_relative_absolute_steps(
     preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
 ) -> None:
@@ -101,6 +111,8 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     Raises:
         NotImplementedError: If the policy name is not recognized.
     """
+    name = normalize_policy_type(name)
+
     if name == "tdmpc":
         from .tdmpc.modeling_tdmpc import TDMPCPolicy
 
@@ -199,6 +211,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
     Raises:
         ValueError: If the `policy_type` is not recognized.
     """
+    policy_type = normalize_policy_type(policy_type)
+
     if policy_type == "tdmpc":
         return TDMPCConfig(**kwargs)
     elif policy_type == "diffusion":

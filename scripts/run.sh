@@ -23,7 +23,7 @@ python -m lerobot.async_inference.robot_client \
   --robot.cameras='{ front: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.4:1.0-video-index0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type:
     opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.2:1.0-video-index0, width: 640, height: 480, fps: 30}, right: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.1:1.0-video-index0, width: 640, height: 480,
     fps: 30, fourcc: "MJPG"}}' \
-  --task="go to left dark box. take the red cube. go to middle light-colored box. put the red cube in box." \
+  --task="go to red cube. take the red cube. go to box. put the red cube in box." \
   --policy_type=pi05 \
   --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05/ \
   --policy_device=cuda \
@@ -44,9 +44,9 @@ python -m lerobot.async_inference.robot_client \
   --robot.cameras='{ front: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.4:1.0-video-index0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type:
     opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.2:1.0-video-index0, width: 640, height: 480, fps: 30}, right: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.1:1.0-video-index0, width: 640, height: 480,
     fps: 30, fourcc: "MJPG"}}' \
-  --task="go to left dark box. take the red cube. go to middle light-colored box. put the red cube in box." \
+  --task="go to red cube. take the red cube. go to box. put the red cube in box." \
   --policy_type=pi05 \
-  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05/ \
+  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05_lora_expert/ \
   --policy_device=cuda \
   --actions_per_chunk=50 \
   --chunk_size_threshold=1.0 \

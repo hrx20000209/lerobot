@@ -22,8 +22,30 @@ DEFAULT_INFERENCE_LATENCY = 1 / DEFAULT_FPS
 """Server side: Timeout for observation queue in seconds"""
 DEFAULT_OBS_QUEUE_TIMEOUT = 2
 
-# All action chunking policies
-SUPPORTED_POLICIES = ["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot", "fast_wam"]
+# All action chunking policies. Keep names in their canonical policy factory form.
+SUPPORTED_POLICIES = [
+    "act",
+    "smolvla",
+    "diffusion",
+    "tdmpc",
+    "vqbet",
+    "pi0",
+    "pi05",
+    "groot",
+    "fast_wam",
+    "vla_jepa",
+]
+
+# Backward-compatible CLI aliases. Some scripts and checkpoints refer to VLA-JEPA with a hyphen,
+# while the LeRobot policy registry uses underscores for Python-compatible module names.
+POLICY_TYPE_ALIASES = {
+    "vla-jepa": "vla_jepa",
+}
+
+
+def normalize_policy_type(policy_type: str) -> str:
+    """Return the canonical policy registry name for a user-supplied policy type."""
+    return POLICY_TYPE_ALIASES.get(policy_type, policy_type)
 
 # TODO: Add all other robots
 SUPPORTED_ROBOTS = ["so100_follower", "so101_follower", "bi_so_follower", "omx_follower"]

@@ -23,6 +23,7 @@ from .constants import (
     DEFAULT_FPS,
     DEFAULT_INFERENCE_LATENCY,
     DEFAULT_OBS_QUEUE_TIMEOUT,
+    normalize_policy_type,
 )
 
 # Aggregate function registry for CLI usage
@@ -160,6 +161,8 @@ class RobotClientConfig:
 
         if not self.policy_type:
             raise ValueError("policy_type cannot be empty")
+
+        self.policy_type = normalize_policy_type(self.policy_type)
 
         if not self.pretrained_name_or_path:
             raise ValueError("pretrained_name_or_path cannot be empty")
