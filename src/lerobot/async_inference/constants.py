@@ -31,6 +31,7 @@ SUPPORTED_POLICIES = [
     "vqbet",
     "pi0",
     "pi05",
+    "giga_world",
     "groot",
     "fast_wam",
     "vla_jepa",

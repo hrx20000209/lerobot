@@ -47,12 +47,13 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
-from .fast_wam.configuration_fast_wam import FastWAMConfig
 from .eo1.configuration_eo1 import EO1Config
+from .fast_wam.configuration_fast_wam import FastWAMConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
+from .giga_world.configuration_giga_world import GigaWorldConfig
 from .groot.configuration_groot import GrootConfig
-from .molmoact2.configuration_molmoact2 import MolmoAct2Config
 from .lingbo_va.configuration_lingbo_va import LingBoVAConfig
+from .molmoact2.configuration_molmoact2 import MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -64,7 +65,6 @@ from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
-
 
 POLICY_TYPE_ALIASES = {
     "vla-jepa": "vla_jepa",
@@ -153,6 +153,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .gaussian_actor.modeling_gaussian_actor import GaussianActorPolicy
 
         return GaussianActorPolicy
+    elif name == "giga_world":
+        from .giga_world.modeling_giga_world import GigaWorldPolicy
+
+        return GigaWorldPolicy
     elif name == "smolvla":
         from .smolvla.modeling_smolvla import SmolVLAPolicy
 
@@ -231,6 +235,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05Config(**kwargs)
     elif policy_type == "gaussian_actor":
         return GaussianActorConfig(**kwargs)
+    elif policy_type == "giga_world":
+        return GigaWorldConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
     elif policy_type == "groot":
@@ -430,6 +436,14 @@ def make_pre_post_processors(
         from .gaussian_actor.processor_gaussian_actor import make_gaussian_actor_pre_post_processors
 
         processors = make_gaussian_actor_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, GigaWorldConfig):
+        from .giga_world.processor_giga_world import make_giga_world_pre_post_processors
+
+        processors = make_giga_world_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
