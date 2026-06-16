@@ -103,6 +103,8 @@ python -m lerobot.async_inference.robot_client \
   --debug_visualize_queue_size=True 
 
 python -m lerobot.async_inference.policy_server \
-    --host=0.0.0.0 \
-    --port=8080
-    
+  --host=0.0.0.0 \
+  --port=8080 \
+  --fps=30 \
+  --inference_latency=0.033 \
+  --obs_queue_timeout=1
