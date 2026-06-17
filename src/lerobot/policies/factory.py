@@ -67,6 +67,8 @@ from .wall_x.configuration_wall_x import WallXConfig
 from .xvla.configuration_xvla import XVLAConfig
 
 POLICY_TYPE_ALIASES = {
+    "giga-world": "giga_world",
+    "gigaworld": "giga_world",
     "vla-jepa": "vla_jepa",
 }
 

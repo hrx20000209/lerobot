@@ -61,6 +61,7 @@ class GigaWorldConfig(PreTrainedConfig):
     crop_mode: str = "center"
     t5_len: int = 64
     text_encoder_max_length: int = 512
+    text_encoder_device: str = "cpu"
     num_inference_frames: int = 5
     num_inference_steps: int = 10
     guidance_scale: float = 0.0

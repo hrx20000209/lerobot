@@ -118,8 +118,8 @@ class RobotClient:
 
         self.shutdown_event = threading.Event()
         self._stopped = False
-        self.latency_recorder = LatencyRecorder("robot_client")
-        self.timeline_image_mode = os.getenv("LEROBOT_TIMELINE_SAVE_IMAGES", "")
+        self.latency_recorder = LatencyRecorder("robot_client", log_dir=config.timeline_log_dir)
+        self.timeline_image_mode = config.timeline_save_images or os.getenv("LEROBOT_TIMELINE_SAVE_IMAGES", "")
         self.timeline_image_dir = (
             self.latency_recorder.log_dir / f"robot_client_observation_images_{self.latency_recorder.run_id}"
         )
@@ -145,6 +145,11 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+
+    def _record_timeline(self, kind: str, **metrics: Any) -> dict[str, Any] | None:
+        if not self.config.record_timeline:
+            return None
+        return self.latency_recorder.record(kind, **metrics)
 
     @property
     def running(self):
@@ -338,6 +343,7 @@ class RobotClient:
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
                 first_action_timestep = timed_actions[0].get_timestep() if timed_actions else -1
                 last_action_timestep = timed_actions[-1].get_timestep() if timed_actions else -1
+                incoming_timesteps = [a.get_timestep() for a in timed_actions]
                 observation_to_actions_latency = (
                     (receive_time - timed_actions[0].get_timestamp()) * 1000 if timed_actions else 0
                 )
@@ -368,8 +374,8 @@ class RobotClient:
                     if isinstance(inference_start_time, int | float) and isinstance(
                         inference_end_time, int | float
                     ):
-                        self.latency_recorder.record(
-                            "timeline_vla_inference",
+                        self._record_timeline(
+                            "timeline_server_inference",
                             timestep=server_timeline.get("observation_timestep", first_action_timestep),
                             observation_time=server_timeline.get("observation_timestamp"),
                             start_time=inference_start_time,
@@ -377,24 +383,26 @@ class RobotClient:
                             first_timestep=first_action_timestep,
                             last_timestep=last_action_timestep,
                             actions_count=len(timed_actions),
+                            queue_size_at_observation=server_timeline.get("queue_size_at_observation"),
+                            must_go=server_timeline.get("must_go"),
                             received_time=receive_time,
                             server_to_client_ms=server_to_client_latency,
                         )
 
                 # Calculate network latency if we have matching observations
+                old_size = -1
+                old_timesteps: list[int] = []
+                if self.config.record_timeline or verbose:
+                    old_size, old_timesteps = self._inspect_action_queue()
+                    if not old_timesteps:
+                        with self.latest_action_lock:
+                            old_timesteps = [self.latest_action]
+
                 if len(timed_actions) > 0 and verbose:
                     with self.latest_action_lock:
                         latest_action = self.latest_action
 
                     self.logger.debug(f"Current latest action: {latest_action}")
-
-                    # Get queue state before changes
-                    old_size, old_timesteps = self._inspect_action_queue()
-                    if not old_timesteps:
-                        old_timesteps = [latest_action]  # queue was empty
-
-                    # Log incoming actions
-                    incoming_timesteps = [a.get_timestep() for a in timed_actions]
 
                     self.logger.info(
                         f"Received action chunk for step #{first_action_timestep} | "
@@ -408,6 +416,10 @@ class RobotClient:
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
+                new_size = -1
+                new_timesteps: list[int] = []
+                if self.config.record_timeline or verbose:
+                    new_size, new_timesteps = self._inspect_action_queue()
                 self.latency_recorder.record(
                     "client_receive_actions",
                     first_timestep=first_action_timestep,
@@ -420,21 +432,35 @@ class RobotClient:
                     queue_update_ms=queue_update_time * 1000,
                     total_ms=(get_actions_rpc_time + deserialize_time + queue_update_time) * 1000,
                 )
+                self._record_timeline(
+                    "timeline_receive_actions",
+                    first_timestep=first_action_timestep,
+                    last_timestep=last_action_timestep,
+                    actions_count=len(timed_actions),
+                    receive_time=receive_time,
+                    queue_size_before=old_size,
+                    queue_size_after=new_size,
+                    server_to_client_ms=server_to_client_latency,
+                )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
                 if verbose:
-                    # Get queue state after changes
-                    new_size, new_timesteps = self._inspect_action_queue()
-
                     with self.latest_action_lock:
                         latest_action = self.latest_action
 
+                    old_steps = f"{old_timesteps[0]}:{old_timesteps[-1]}" if old_timesteps else "empty"
+                    incoming_steps = (
+                        f"{incoming_timesteps[0]}:{incoming_timesteps[-1]}"
+                        if incoming_timesteps
+                        else "empty"
+                    )
+                    new_steps = f"{new_timesteps[0]}:{new_timesteps[-1]}" if new_timesteps else "empty"
                     self.logger.info(
                         f"Latest action: {latest_action} | "
-                        f"Old action steps: {old_timesteps[0]}:{old_timesteps[-1]} | "
-                        f"Incoming action steps: {incoming_timesteps[0]}:{incoming_timesteps[-1]} | "
-                        f"Updated action steps: {new_timesteps[0]}:{new_timesteps[-1]}"
+                        f"Old action steps: {old_steps} | "
+                        f"Incoming action steps: {incoming_steps} | "
+                        f"Updated action steps: {new_steps}"
                     )
                     self.logger.debug(
                         f"Queue update complete ({queue_update_time:.6f}s) | "
@@ -460,9 +486,11 @@ class RobotClient:
         # Lock only for queue operations
         get_start = time.perf_counter()
         with self.action_queue_lock:
-            self.action_queue_size.append(self.action_queue.qsize())
+            queue_size_before_pop = self.action_queue.qsize()
+            self.action_queue_size.append(queue_size_before_pop)
             # Get action from queue
             timed_action = self.action_queue.get_nowait()
+            queue_size_after_pop = self.action_queue.qsize()
         get_end = time.perf_counter() - get_start
 
         execution_start_time = time.time()
@@ -498,7 +526,7 @@ class RobotClient:
             action_age_ms=(time.time() - timed_action.get_timestamp()) * 1000,
             total_ms=(get_end + send_action_time) * 1000,
         )
-        self.latency_recorder.record(
+        self._record_timeline(
             "timeline_action",
             timestep=timed_action.get_timestep(),
             start_time=execution_start_time,
@@ -509,6 +537,8 @@ class RobotClient:
             source_observation_age_ms=source_observation_age_ms,
             inference_start_time=inference_start_time,
             inference_end_time=inference_end_time,
+            queue_size_before=queue_size_before_pop,
+            queue_size_after=queue_size_after_pop,
         )
 
         if verbose:
@@ -558,12 +588,22 @@ class RobotClient:
             with self.action_queue_lock:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
+            observation.metadata.update(
+                {
+                    "capture_start_time": capture_start_time,
+                    "capture_end_time": capture_end_time,
+                    "queue_size_at_capture": current_queue_size,
+                    "latest_action": latest_action,
+                    "latest_action_time": latest_action_wall_time,
+                    "must_go": int(observation.must_go),
+                }
+            )
 
             image_paths = save_observation_images(
                 raw_observation,
                 self.timeline_image_dir,
                 observation.get_timestep(),
-                mode=self.timeline_image_mode,
+                mode=self.timeline_image_mode if self.config.record_timeline else "",
                 key_frame=observation.must_go,
             )
             _ = self.send_observation(observation)
@@ -579,7 +619,7 @@ class RobotClient:
                 if isinstance(latest_action_wall_time, int | float)
                 else None
             )
-            self.latency_recorder.record(
+            self._record_timeline(
                 "timeline_observation",
                 timestep=observation.get_timestep(),
                 start_time=capture_start_time,

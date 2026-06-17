@@ -32,9 +32,11 @@ from lerobot.policies import (  # noqa: F401
     ACTConfig,
     DiffusionConfig,
     FastWAMConfig,
+    GigaWorldConfig,
     PI0Config,
     PI05Config,
     SmolVLAConfig,
+    VLAJEPAConfig,
     VQBeTConfig,
 )
 from lerobot.robots.robot import Robot
@@ -446,9 +448,13 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def get_observation(self):
         return self.observation
+
+    def get_metadata(self):
+        return self.metadata
 
 
 @dataclass

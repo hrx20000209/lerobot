@@ -74,7 +74,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
-        self.latency_recorder = LatencyRecorder("policy_server")
+        self.latency_recorder = LatencyRecorder("policy_server", log_dir=config.timeline_log_dir)
 
         self.observation_queue = Queue(maxsize=1)
 
@@ -91,6 +91,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+
+    def _record_timeline(self, kind: str, **metrics: Any) -> dict[str, Any] | None:
+        if not self.config.record_timeline:
+            return None
+        return self.latency_recorder.record(kind, **metrics)
 
     @property
     def running(self):
@@ -297,11 +302,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
             start_time = time.perf_counter()
             if action_chunk:
+                obs_metadata = obs.get_metadata() if hasattr(obs, "get_metadata") else {}
+                if not isinstance(obs_metadata, dict):
+                    obs_metadata = {}
+                queue_size_at_observation = obs_metadata.get("queue_size_at_capture")
                 server_timeline = {
                     "observation_timestep": obs.get_timestep(),
                     "observation_timestamp": obs.get_timestamp(),
                     "inference_start_time": inference_start_time,
                     "inference_end_time": inference_end_time,
+                    "first_timestep": action_chunk[0].get_timestep(),
+                    "last_timestep": action_chunk[-1].get_timestep(),
+                    "actions_count": len(action_chunk),
+                    "queue_size_at_observation": queue_size_at_observation,
+                    "must_go": int(obs.must_go),
                 }
                 for timed_action in action_chunk:
                     timed_action.metadata.update(
@@ -343,8 +357,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 total_ms=(time.perf_counter() - getactions_starts) * 1000,
                 **predict_timing,
             )
-            self.latency_recorder.record(
-                "timeline_vla_inference",
+            self._record_timeline(
+                "timeline_server_inference",
                 timestep=obs.get_timestep(),
                 observation_time=obs.get_timestamp(),
                 start_time=inference_start_time,
@@ -352,6 +366,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 first_timestep=action_chunk[0].get_timestep() if action_chunk else -1,
                 last_timestep=action_chunk[-1].get_timestep() if action_chunk else -1,
                 actions_count=len(action_chunk),
+                queue_size_at_observation=(
+                    obs.get_metadata().get("queue_size_at_capture")
+                    if hasattr(obs, "get_metadata") and isinstance(obs.get_metadata(), dict)
+                    else None
+                ),
+                must_go=int(obs.must_go),
             )
 
             time.sleep(sleep_time)  # sleep controls inference latency
@@ -454,10 +474,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             if candidate is None:
                 continue
             getter = getattr(candidate, "get_and_reset_latency_profile", None)
-            if callable(getter):
-                data = getter()
-            else:
-                data = getattr(candidate, "last_latency_profile", None)
+            data = getter() if callable(getter) else getattr(candidate, "last_latency_profile", None)
             if isinstance(data, dict):
                 for key, value in data.items():
                     if isinstance(value, int | float) and not isinstance(value, bool):

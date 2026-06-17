@@ -451,6 +451,7 @@ class GigaWorldPolicy(PreTrainedPolicy):
         from transformers import AutoTokenizer, UMT5EncoderModel
 
         cache_dir = self._model_cache_dir()
+        text_device = torch.device(self.config.text_encoder_device)
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.wan_model_id,
             subfolder="tokenizer",
@@ -461,7 +462,7 @@ class GigaWorldPolicy(PreTrainedPolicy):
             subfolder="text_encoder",
             torch_dtype=torch.float32,
             cache_dir=cache_dir,
-        ).to(self.device)
+        ).to(text_device)
         self.text_encoder.eval()
         for param in self.text_encoder.parameters():
             param.requires_grad_(False)
@@ -668,8 +669,9 @@ class GigaWorldPolicy(PreTrainedPolicy):
                 return_attention_mask=True,
                 return_tensors="pt",
             )
-            input_ids = inputs.input_ids.to(self.device)
-            attention_mask = inputs.attention_mask.to(self.device)
+            text_device = next(self.text_encoder.parameters()).device
+            input_ids = inputs.input_ids.to(text_device)
+            attention_mask = inputs.attention_mask.to(text_device)
             hidden = self.text_encoder(input_ids, attention_mask).last_hidden_state.float()
             seq_lens = attention_mask.gt(0).sum(dim=1).long()
             for prompt, emb, seq_len in zip(missing, hidden, seq_lens, strict=False):

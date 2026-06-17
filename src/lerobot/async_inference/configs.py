@@ -64,6 +64,14 @@ class PolicyServerConfig:
     obs_queue_timeout: float = field(
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
+    record_timeline: bool = field(
+        default=False,
+        metadata={"help": "Record async inference timeline events for plotting"},
+    )
+    timeline_log_dir: str = field(
+        default="logs",
+        metadata={"help": "Directory for latency and optional timeline JSONL files"},
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -97,6 +105,8 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "record_timeline": self.record_timeline,
+            "timeline_log_dir": self.timeline_log_dir,
         }
 
 
@@ -147,6 +157,20 @@ class RobotClientConfig:
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
+    )
+    record_timeline: bool = field(
+        default=False,
+        metadata={"help": "Record async inference timeline events for plotting"},
+    )
+    timeline_log_dir: str = field(
+        default="logs",
+        metadata={"help": "Directory for latency and optional timeline JSONL files"},
+    )
+    timeline_save_images: str = field(
+        default="",
+        metadata={
+            "help": "Save observation images for timeline inspection: off/empty, key, or all"
+        },
     )
 
     @property
@@ -203,4 +227,7 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "record_timeline": self.record_timeline,
+            "timeline_log_dir": self.timeline_log_dir,
+            "timeline_save_images": self.timeline_save_images,
         }

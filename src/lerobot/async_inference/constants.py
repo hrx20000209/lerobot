@@ -40,6 +40,8 @@ SUPPORTED_POLICIES = [
 # Backward-compatible CLI aliases. Some scripts and checkpoints refer to VLA-JEPA with a hyphen,
 # while the LeRobot policy registry uses underscores for Python-compatible module names.
 POLICY_TYPE_ALIASES = {
+    "giga-world": "giga_world",
+    "gigaworld": "giga_world",
     "vla-jepa": "vla_jepa",
 }
 
