@@ -41,9 +41,7 @@ python -m lerobot.async_inference.robot_client \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM1 \
   --robot.id=follower_arm \
-  --robot.cameras='{ front: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.4:1.0-video-index0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type:
-    opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.2:1.0-video-index0, width: 640, height: 480, fps: 30}, right: {type: opencv, index_or_path: /dev/v4l/by-path/platform-a80aa10000.usb-usb-0:4.2.1:1.0-video-index0, width: 640, height: 480,
-    fps: 30, fourcc: "MJPG"}}' \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --task="go to red cube. take the red cube. go to box. put the red cube in box." \
   --policy_type=pi05 \
   --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05_lora_expert/ \
