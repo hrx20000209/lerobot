@@ -366,8 +366,17 @@ def prepare_raw_observation(
     # -> {observation.state:[value1,value2,...], observation.images.laptop:np.ndarray}
     lerobot_obs = make_lerobot_observation(robot_obs, lerobot_features)
 
-    # 2. Greps all observation.images.<> keys
-    image_keys = list(filter(is_image_key, lerobot_obs))
+    # 2. Keep only the image keys the active policy expects. The robot may expose
+    # extra cameras (for example right/front/wrist) while a checkpoint was trained
+    # with only a subset (for example front+wrist).
+    robot_image_keys = set(filter(is_image_key, lerobot_obs))
+    image_keys = list(policy_image_features.keys())
+    missing_image_keys = [key for key in image_keys if key not in robot_image_keys]
+    if missing_image_keys:
+        raise KeyError(
+            f"Robot observation is missing image keys required by the policy: {missing_image_keys}. "
+            f"Available image keys: {sorted(robot_image_keys)}"
+        )
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
     image_dict = {

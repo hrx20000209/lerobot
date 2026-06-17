@@ -25,10 +25,11 @@ RECORD_TIMELINE="${RECORD_TIMELINE:-true}"
 TIMELINE_LOG_DIR="${TIMELINE_LOG_DIR:-/home/rxhuang/Projects/lerobot/logs/async_timeline}"
 TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-key}"
 DEBUG_VISUALIZE_QUEUE_SIZE="${DEBUG_VISUALIZE_QUEUE_SIZE:-True}"
+PYTHON_BIN="${PYTHON_BIN:-/home/rxhuang/anaconda3/envs/lerobot/bin/python}"
 
 cd /home/rxhuang/Projects/lerobot
 
-python -m lerobot.async_inference.robot_client \
+"${PYTHON_BIN}" -m lerobot.async_inference.robot_client \
   --server_address="${SERVER_ADDRESS}" \
   --robot.type=so101_follower \
   --robot.port="${ROBOT_PORT}" \
