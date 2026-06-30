@@ -1,17 +1,37 @@
 lerobot-record \
   --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
+  --robot.port=/dev/ttyACM1\
   --robot.id=follower_arm \
   --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --dataset.repo_id=hrx2000/eval_pi0 \
-  --dataset.single_task="Go to the cube. Take the cube. Go to the box. Put the cube in the box." \
-  --policy.path=/home/hrx/Projects/models/blue_cube/act/ \
+  --dataset.single_task="go to red cube. take the red cube. go to box. put the red cube in box." \
+  --policy.path=/home/hrx/Projects/models/three_cubes_1/smolvla/ \
   --policy.device=cuda \
   --dataset.episode_time_s=600 \
   --dataset.push_to_hub=false \
   --display_data=true \
   --dataset.fps=10 
   # --dataset.rename_map='{"observation.images.wrist": "observation.images.right"}'
+
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM1 \
+  --robot.id=follower_arm \
+  --robot.cameras='{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+  --dataset.repo_id=hrx2000/eval_pi0 \
+  --dataset.single_task="go to red cube. take the red cube. go to box. put the red cube in box." \
+  --policy.path=/home/hrx/Projects/models/three_cubes_1/vla_jepa_lora/ \
+  --rename_map='{"observation.images.front": "observation.images.exterior_1_left", "observation.images.wrist": "observation.images.exterior_2_left"}' \
+  --policy.device=cuda \
+  --inference.type=rtc \
+  --inference.rtc.enabled=true \
+  --inference.queue_threshold=5 \
+  --fps=15 \
+  --interpolation_multiplier=2 \
+  --dataset.episode_time_s=600 \
+  --dataset.push_to_hub=false \
+  --display_data=true \
+  --dataset.fps=30
 
 
 # remote

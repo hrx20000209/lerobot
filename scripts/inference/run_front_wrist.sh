@@ -8,26 +8,28 @@ set -euo pipefail
 #     scripts/inference/run_front_wrist.sh
 
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8080}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 ROBOT_PORT="${ROBOT_PORT:-/dev/ttyACM1}"
 ROBOT_ID="${ROBOT_ID:-follower_arm}"
 FRONT_CAMERA_INDEX="${FRONT_CAMERA_INDEX:-4}"
 WRIST_CAMERA_INDEX="${WRIST_CAMERA_INDEX:-2}"
 POLICY_TYPE="${POLICY_TYPE:-pi05}"
-PRETRAINED_NAME_OR_PATH="${PRETRAINED_NAME_OR_PATH:-/home/rxhuang/Projects/lerobot/output_lerobot_train/three_cubes/pi05_front_wrist_r64_full_expert_pad01_b24_after_smolvla/checkpoints/last/pretrained_model}"
+PRETRAINED_NAME_OR_PATH="${PRETRAINED_NAME_OR_PATH:-/home/hrx/Projects/models/three_cubes_1/pi05_front_wrist}"
 POLICY_DEVICE="${POLICY_DEVICE:-cuda}"
 CLIENT_DEVICE="${CLIENT_DEVICE:-cpu}"
 ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-50}"
-CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-1.0}"
+CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-0.5}"
 AGGREGATE_FN_NAME="${AGGREGATE_FN_NAME:-conservative}"
 FPS="${FPS:-30}"
 TASK="${TASK:-go to red cube. take the red cube. go to box. put the red cube in box.}"
 RECORD_TIMELINE="${RECORD_TIMELINE:-true}"
-TIMELINE_LOG_DIR="${TIMELINE_LOG_DIR:-/home/rxhuang/Projects/lerobot/logs/async_timeline}"
+TIMELINE_LOG_DIR="${TIMELINE_LOG_DIR:-/home/hrx/Projects/lerobot/logs/async_timeline}"
 TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-key}"
+RECORD_SYSTEM_RESOURCES="${RECORD_SYSTEM_RESOURCES:-false}"
+SYSTEM_RESOURCE_INTERVAL_S="${SYSTEM_RESOURCE_INTERVAL_S:-1.0}"
+SYSTEM_RESOURCE_SAMPLE_NVIDIA_SMI="${SYSTEM_RESOURCE_SAMPLE_NVIDIA_SMI:-false}"
 DEBUG_VISUALIZE_QUEUE_SIZE="${DEBUG_VISUALIZE_QUEUE_SIZE:-True}"
-PYTHON_BIN="${PYTHON_BIN:-/home/rxhuang/anaconda3/envs/lerobot/bin/python}"
 
-cd /home/rxhuang/Projects/lerobot
 
 "${PYTHON_BIN}" -m lerobot.async_inference.robot_client \
   --server_address="${SERVER_ADDRESS}" \
@@ -47,4 +49,7 @@ cd /home/rxhuang/Projects/lerobot
   --record_timeline="${RECORD_TIMELINE}" \
   --timeline_log_dir="${TIMELINE_LOG_DIR}" \
   --timeline_save_images="${TIMELINE_SAVE_IMAGES}" \
+  --record_system_resources="${RECORD_SYSTEM_RESOURCES}" \
+  --system_resource_interval_s="${SYSTEM_RESOURCE_INTERVAL_S}" \
+  --system_resource_sample_nvidia_smi="${SYSTEM_RESOURCE_SAMPLE_NVIDIA_SMI}" \
   --debug_visualize_queue_size="${DEBUG_VISUALIZE_QUEUE_SIZE}"

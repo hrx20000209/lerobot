@@ -87,6 +87,7 @@ lerobot-record \\
 """
 
 import logging
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -522,6 +523,13 @@ def record(
 
 def main():
     register_third_party_plugins()
+    if any(arg.startswith("--policy.path=") for arg in sys.argv[1:]):
+        if not any(arg.startswith("--strategy.type=") for arg in sys.argv[1:]):
+            sys.argv.insert(1, "--strategy.type=episodic")
+        from lerobot.scripts.lerobot_rollout import rollout
+
+        rollout()
+        return
     record()
 
 

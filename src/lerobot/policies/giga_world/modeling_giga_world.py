@@ -259,7 +259,8 @@ class GigaWorldPolicy(PreTrainedPolicy):
         return root
 
     def _model_cache_dir(self) -> Path:
-        path = Path(self.config.model_cache_dir).expanduser()
+        env_cache_dir = os.environ.get("GIGA_WORLD_MODEL_CACHE_DIR")
+        path = Path(env_cache_dir if env_cache_dir else self.config.model_cache_dir).expanduser()
         path.mkdir(parents=True, exist_ok=True)
         return path
 

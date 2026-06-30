@@ -62,6 +62,7 @@ from .helpers import (
     observations_similar,
     raw_observation_to_observation,
 )
+from .system_resources import SystemResourceRecorder
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
@@ -75,6 +76,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
         self.latency_recorder = LatencyRecorder("policy_server", log_dir=config.timeline_log_dir)
+        self.system_resource_recorder = SystemResourceRecorder(
+            "policy_server",
+            log_dir=config.timeline_log_dir,
+            interval_s=config.system_resource_interval_s,
+            enabled=config.record_system_resources,
+            sample_nvidia_smi=config.system_resource_sample_nvidia_smi,
+        )
+        self.system_resource_recorder.start()
 
         self.observation_queue = Queue(maxsize=1)
 
@@ -162,16 +171,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         start = time.perf_counter()
         self.policy = self._load_policy(policy_specs)
 
-        # Load preprocessor and postprocessor, overriding device to match requested device
+        # Load preprocessor and postprocessor, overriding device to match requested device.
+        # GigaWorld stores Identity-only processors; its policy moves tensors to the
+        # policy device internally, so device/rename overrides do not apply.
         device_override = {"device": self.device}
+        if policy_specs.policy_type == "giga_world":
+            preprocessor_overrides = {}
+            postprocessor_overrides = {}
+        else:
+            preprocessor_overrides = {
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+            }
+            postprocessor_overrides = {"device_processor": device_override}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
+            preprocessor_overrides=preprocessor_overrides,
+            postprocessor_overrides=postprocessor_overrides,
         )
 
         end = time.perf_counter()
@@ -578,6 +595,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def stop(self):
         """Stop the server"""
         self._reset_server()
+        resource_summary = self.system_resource_recorder.stop()
+        if resource_summary is not None:
+            self.logger.info(
+                "System resource summary written to %s",
+                self.system_resource_recorder.summary_path,
+            )
         self.latency_recorder.log_summary(self.logger)
         self.latency_recorder.close()
         self.logger.info("Server stopping...")

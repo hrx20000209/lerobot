@@ -75,6 +75,9 @@ class PreSnapGripperProcessorStep(ProcessorStep):
             transition[TransitionKey.ACTION] = a
         return transition
 
+    def get_config(self) -> dict[str, Any]:
+        return {"gripper_dim": self.gripper_dim, "threshold": self.threshold}
+
     def transform_features(self, features):
         return features
 
@@ -99,6 +102,9 @@ class BinarizeGripperProcessorStep(ProcessorStep):
             a[..., self.gripper_dim] = 1.0 - 2.0 * (a[..., self.gripper_dim] > self.threshold).float()
             transition[TransitionKey.ACTION] = a
         return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"gripper_dim": self.gripper_dim, "threshold": self.threshold}
 
     def transform_features(self, features):
         return features

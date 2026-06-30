@@ -31,6 +31,8 @@ exec "${LEROBOT_TRAIN}" \
   --policy.world_model_loss_weight=0.1 \
   --policy.reinit_modules='["model.action_model.action_encoder", "model.action_model.action_decoder", "model.action_model.state_encoder"]' \
   --policy.gripper_dim=5 \
+  --policy.pre_snap_gripper_action=false \
+  --policy.binarize_gripper_action=false \
   --policy.repeated_diffusion_steps=4 \
   --policy.push_to_hub=false \
   --peft.method_type=LORA \

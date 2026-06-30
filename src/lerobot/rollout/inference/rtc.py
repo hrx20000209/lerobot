@@ -22,6 +22,7 @@ way via ``notify_observation``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import time
@@ -157,6 +158,31 @@ class RTCInferenceEngine(InferenceEngine):
                         k for k in robot_wrapper.action_features if k.endswith(".pos")
                     ]
             logger.info("Relative actions enabled: RTC prefix will be re-anchored")
+
+        self._predict_action_supports_rtc_kwargs = self._supports_rtc_predict_kwargs()
+        if not self._predict_action_supports_rtc_kwargs:
+            logger.info(
+                "Policy predict_action_chunk does not accept RTC kwargs; "
+                "using plain async chunk generation"
+            )
+
+    def _supports_rtc_predict_kwargs(self) -> bool:
+        try:
+            parameters = inspect.signature(self._policy.predict_action_chunk).parameters
+        except (TypeError, ValueError):
+            return False
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()) or (
+            "inference_delay" in parameters and "prev_chunk_left_over" in parameters
+        )
+
+    def _postprocess_action_chunk(self, actions: torch.Tensor) -> torch.Tensor:
+        if actions.ndim != 3:
+            return self._postprocessor(actions).squeeze(0)
+
+        processed_actions = []
+        for idx in range(actions.shape[1]):
+            processed_actions.append(self._postprocessor(actions[:, idx, :]))
+        return torch.stack(processed_actions, dim=1).squeeze(0)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -304,12 +330,15 @@ class RTCInferenceEngine(InferenceEngine):
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
 
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
-                        )
+                        if self._predict_action_supports_rtc_kwargs:
+                            actions = self._policy.predict_action_chunk(
+                                preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                            )
+                        else:
+                            actions = self._policy.predict_action_chunk(preprocessed)
 
                         original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
+                        processed = self._postprocess_action_chunk(actions)
                         new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
 

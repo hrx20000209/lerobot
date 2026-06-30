@@ -130,6 +130,7 @@ class EpisodicStrategy(RolloutStrategy):
                         control_time_s=episode_time_s,
                         dataset=dataset,
                         single_task=single_task,
+                        display_compressed=display_compressed,
                     )
 
                     # Reset phase, skip after the last episode (but run when re-recording)
@@ -207,6 +208,7 @@ class EpisodicStrategy(RolloutStrategy):
         control_time_s: float,
         dataset,
         single_task: str,
+        display_compressed: bool,
     ) -> None:
         """Policy-driven recording loop for a single episode."""
         interpolator = self._interpolator
@@ -227,6 +229,12 @@ class EpisodicStrategy(RolloutStrategy):
 
             obs = robot.get_observation()
             obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+            if ctx.runtime.cfg.display_data:
+                log_rerun_data(
+                    observation=obs_processed,
+                    action=None,
+                    compress_images=display_compressed,
+                )
 
             if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, loop_start, control_interval):
                 continue
@@ -237,7 +245,7 @@ class EpisodicStrategy(RolloutStrategy):
                 obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                 action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
                 dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
-                self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                self._log_telemetry(None, action_dict, ctx.runtime)
 
             dt = time.perf_counter() - loop_start
             sleep_t = control_interval - dt

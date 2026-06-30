@@ -72,6 +72,20 @@ class PolicyServerConfig:
         default="logs",
         metadata={"help": "Directory for latency and optional timeline JSONL files"},
     )
+    record_system_resources: bool = field(
+        default=False,
+        metadata={"help": "Record CPU, memory, GPU, and power usage samples to JSONL"},
+    )
+    system_resource_interval_s: float = field(
+        default=1.0,
+        metadata={"help": "System resource sampling interval in seconds"},
+    )
+    system_resource_sample_nvidia_smi: bool = field(
+        default=False,
+        metadata={
+            "help": "Also call nvidia-smi for GPU samples. Disabled by default to avoid fork warnings in gRPC."
+        },
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -86,6 +100,11 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.system_resource_interval_s <= 0:
+            raise ValueError(
+                f"system_resource_interval_s must be positive, got {self.system_resource_interval_s}"
+            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -107,6 +126,9 @@ class PolicyServerConfig:
             "inference_latency": self.inference_latency,
             "record_timeline": self.record_timeline,
             "timeline_log_dir": self.timeline_log_dir,
+            "record_system_resources": self.record_system_resources,
+            "system_resource_interval_s": self.system_resource_interval_s,
+            "system_resource_sample_nvidia_smi": self.system_resource_sample_nvidia_smi,
         }
 
 
@@ -172,6 +194,20 @@ class RobotClientConfig:
             "help": "Save observation images for timeline inspection: off/empty, key, or all"
         },
     )
+    record_system_resources: bool = field(
+        default=False,
+        metadata={"help": "Record CPU, memory, GPU, and power usage samples to JSONL"},
+    )
+    system_resource_interval_s: float = field(
+        default=1.0,
+        metadata={"help": "System resource sampling interval in seconds"},
+    )
+    system_resource_sample_nvidia_smi: bool = field(
+        default=False,
+        metadata={
+            "help": "Also call nvidia-smi for GPU samples. Disabled by default to avoid fork warnings in gRPC."
+        },
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -206,6 +242,11 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.system_resource_interval_s <= 0:
+            raise ValueError(
+                f"system_resource_interval_s must be positive, got {self.system_resource_interval_s}"
+            )
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -230,4 +271,7 @@ class RobotClientConfig:
             "record_timeline": self.record_timeline,
             "timeline_log_dir": self.timeline_log_dir,
             "timeline_save_images": self.timeline_save_images,
+            "record_system_resources": self.record_system_resources,
+            "system_resource_interval_s": self.system_resource_interval_s,
+            "system_resource_sample_nvidia_smi": self.system_resource_sample_nvidia_smi,
         }

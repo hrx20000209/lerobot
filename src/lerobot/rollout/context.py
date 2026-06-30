@@ -348,12 +348,6 @@ def build_rollout_context(
                     "names": None,
                 }
 
-            repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
-            if not repo_name.startswith("rollout_"):
-                raise ValueError(
-                    "Dataset names for rollout must start with 'rollout_'. "
-                    "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
-                )
             cfg.dataset.stamp_repo_id()
             target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
             dataset = LeRobotDataset.create(

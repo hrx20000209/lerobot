@@ -81,6 +81,7 @@ from .helpers import (
     save_observation_images,
     visualize_action_queue_size,
 )
+from .system_resources import SystemResourceRecorder
 
 
 class RobotClient:
@@ -119,6 +120,14 @@ class RobotClient:
         self.shutdown_event = threading.Event()
         self._stopped = False
         self.latency_recorder = LatencyRecorder("robot_client", log_dir=config.timeline_log_dir)
+        self.system_resource_recorder = SystemResourceRecorder(
+            "robot_client",
+            log_dir=config.timeline_log_dir,
+            interval_s=config.system_resource_interval_s,
+            enabled=config.record_system_resources,
+            sample_nvidia_smi=config.system_resource_sample_nvidia_smi,
+        )
+        self.system_resource_recorder.start()
         self.timeline_image_mode = config.timeline_save_images or os.getenv("LEROBOT_TIMELINE_SAVE_IMAGES", "")
         self.timeline_image_dir = (
             self.latency_recorder.log_dir / f"robot_client_observation_images_{self.latency_recorder.run_id}"
@@ -203,6 +212,12 @@ class RobotClient:
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
+        resource_summary = self.system_resource_recorder.stop()
+        if resource_summary is not None:
+            self.logger.info(
+                "System resource summary written to %s",
+                self.system_resource_recorder.summary_path,
+            )
         self.latency_recorder.log_summary(self.logger)
         self.latency_recorder.close()
 
@@ -720,6 +735,8 @@ def async_client(cfg: RobotClientConfig):
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")
+    else:
+        client.stop()
 
 
 if __name__ == "__main__":
