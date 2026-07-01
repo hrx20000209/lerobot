@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-/home/rxhuang/anaconda3/envs/lerobot/bin/python}"
 DATASET_ROOT="${DATASET_ROOT:-/data/rxhuang/three_cubes_1}"
 DATASET_REPO_ID="${DATASET_REPO_ID:-hrx2000/Three_Cubes_1}"
 NUM_EPISODES="${NUM_EPISODES:-100}"
 
-exec "${PYTHON_BIN}" -m lerobot.scripts.lerobot_record \
+python -m lerobot.scripts.lerobot_record \
   --robot.type=so101_follower \
   --robot.port="${ROBOT_PORT:-/dev/ttyACM0}" \
   --robot.id="${ROBOT_ID:-follower_arm}" \
