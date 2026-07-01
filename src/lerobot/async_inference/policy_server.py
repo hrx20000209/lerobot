@@ -242,6 +242,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         policy.to(policy_specs.device)
         policy.eval()
+        prepare_for_inference = getattr(policy, "prepare_for_inference", None)
+        if callable(prepare_for_inference):
+            self.logger.info("Preparing policy runtime before accepting observations")
+            if policy_specs.policy_type == "giga_world":
+                prepare_for_inference(task=policy_specs.task)
+            else:
+                prepare_for_inference()
         return policy
 
     def SendObservations(self, request_iterator, context):  # noqa: N802

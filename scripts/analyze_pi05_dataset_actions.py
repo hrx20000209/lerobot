@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--num-inference-timesteps", type=int, default=None)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="Only replay the first N frames. By default the full episode is replayed.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("output_lerobot_eval/pi05_dataset"))
     return parser.parse_args()
 
@@ -93,6 +99,16 @@ def read_saved_rename_map(checkpoint: Path) -> dict[str, str]:
     return {}
 
 
+def device_processor_override(checkpoint: Path, filename: str, device: str) -> dict:
+    processor_path = checkpoint / filename
+    if not processor_path.exists():
+        return {}
+    data = json.loads(processor_path.read_text())
+    if any(step.get("registry_name") == "device_processor" for step in data.get("steps", [])):
+        return {"device_processor": {"device": device}}
+    return {}
+
+
 def make_observation(sample: dict) -> dict:
     observation = {
         key: value
@@ -128,12 +144,13 @@ def predict_chunked_episode(
     execution_horizon: int,
     seed: int,
     num_inference_steps: int | None,
+    max_frames: int | None,
 ) -> tuple[np.ndarray, list[int], np.ndarray]:
-    episode_length = len(dataset)
+    episode_length = min(len(dataset), max_frames) if max_frames is not None else len(dataset)
     action_dim = policy.config.output_features[ACTION].shape[0]
     predictions = np.full((episode_length, action_dim), np.nan, dtype=np.float32)
     per_horizon_errors: list[list[np.ndarray]] = [[] for _ in range(policy.config.chunk_size)]
-    ground_truth = np.asarray(dataset.hf_dataset[ACTION], dtype=np.float32)
+    ground_truth = np.asarray(dataset.hf_dataset[ACTION], dtype=np.float32)[:episode_length]
     anchors = list(range(0, episode_length, execution_horizon))
 
     for anchor_idx, anchor in enumerate(anchors):
@@ -142,7 +159,9 @@ def predict_chunked_episode(
         processed = preprocessor(observation)
         kwargs = make_prediction_kwargs(policy, seed, anchor_idx, num_inference_steps)
 
-        with torch.inference_mode():
+        # Some policies lazily instantiate CUDA modules on their first prediction. Creating those
+        # parameters inside inference_mode can force unsupported inference-tensor kernel paths.
+        with torch.no_grad():
             normalized_chunk = policy.predict_action_chunk(processed, **kwargs)
             action_chunk = postprocessor(normalized_chunk).squeeze(0).cpu().float().numpy()
 
@@ -353,8 +372,12 @@ def main() -> None:
     preprocessor, postprocessor = make_pre_post_processors(
         config,
         pretrained_path=str(checkpoint),
-        preprocessor_overrides={"device_processor": {"device": args.device}},
-        postprocessor_overrides={"device_processor": {"device": args.device}},
+        preprocessor_overrides=device_processor_override(
+            checkpoint, "policy_preprocessor.json", args.device
+        ),
+        postprocessor_overrides=device_processor_override(
+            checkpoint, "policy_postprocessor.json", args.device
+        ),
     )
 
     execution_horizon = args.execution_horizon or config.n_action_steps
@@ -362,6 +385,12 @@ def main() -> None:
         raise ValueError("execution_horizon cannot exceed policy.chunk_size")
 
     ground_truth, states, timestamps = raw_episode_arrays(dataset)
+    if args.max_frames is not None:
+        if args.max_frames <= 0:
+            raise ValueError("max_frames must be positive")
+        ground_truth = ground_truth[: args.max_frames]
+        states = states[: args.max_frames]
+        timestamps = timestamps[: args.max_frames]
     joint_names = list(getattr(config, "action_feature_names", None) or DEFAULT_JOINT_NAMES)
     if len(joint_names) != ground_truth.shape[-1]:
         joint_names = DEFAULT_JOINT_NAMES[: ground_truth.shape[-1]]
@@ -375,6 +404,7 @@ def main() -> None:
         execution_horizon=execution_horizon,
         seed=args.seed,
         num_inference_steps=args.num_inference_steps,
+        max_frames=args.max_frames,
     )
     metrics = compute_metrics(predictions, ground_truth, states, anchors, joint_names)
     metrics.update(
@@ -387,6 +417,7 @@ def main() -> None:
             "chunk_size": config.chunk_size,
             "num_inference_steps": getattr(config, "num_inference_steps", None),
             "num_inference_timesteps": getattr(config, "num_inference_timesteps", None),
+            "max_frames": args.max_frames,
             "seed": args.seed,
             "rename_map": saved_rename_map,
             "first_action_mae": horizon_mae[0].tolist(),

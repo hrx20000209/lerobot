@@ -218,9 +218,10 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     monkeypatch.setattr(PolicyServer, "_get_action_chunk", _fake_get_action_chunk, raising=True)
 
     obs = _make_obs(torch.zeros(6), timestep=5)
-    timed_actions = policy_server._predict_action_chunk(obs)
+    timed_actions, timing = policy_server._predict_action_chunk(obs)
 
     assert len(timed_actions) == actions_per_chunk
+    assert timing["predict_total_ms"] >= 0
     assert [ta.get_timestep() for ta in timed_actions] == list(range(5, 5 + actions_per_chunk))
 
     for i, ta in enumerate(timed_actions):

@@ -19,9 +19,11 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import json
 import logging
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -63,6 +65,24 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+
+def _filter_local_processor_overrides(
+    pretrained_path: str | Path, filename: str, overrides: dict[str, dict]
+) -> dict[str, dict]:
+    config_path = Path(pretrained_path).expanduser() / filename
+    if not config_path.exists():
+        return overrides
+    with open(config_path, encoding="utf-8") as config_file:
+        data = json.load(config_file)
+    available = set()
+    for step in data.get("steps", []):
+        if registry_name := step.get("registry_name"):
+            available.add(registry_name)
+        if class_name := step.get("class"):
+            available.add(class_name)
+            available.add(class_name.rsplit(".", 1)[-1])
+    return {key: value for key, value in overrides.items() if key in available}
 
 
 def update_policy(
@@ -333,6 +353,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "action_names": getattr(active_cfg, "action_feature_names", None),
             }
             postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+        preprocessor_overrides = _filter_local_processor_overrides(
+            processor_pretrained_path, "policy_preprocessor.json", preprocessor_overrides
+        )
+        postprocessor_overrides = _filter_local_processor_overrides(
+            processor_pretrained_path, "policy_postprocessor.json", postprocessor_overrides
+        )
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
@@ -492,6 +518,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         initial_step=step,
         accelerator=accelerator,
     )
+    policy_metric_sums: dict[str, float] = {}
+    policy_metric_count = 0
 
     if is_main_process:
         progbar = tqdm(
@@ -525,6 +553,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
         )
+        if output_dict:
+            for key, value in output_dict.items():
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().float().mean().item()
+                if isinstance(value, int | float):
+                    policy_metric_sums[key] = policy_metric_sums.get(key, 0.0) + float(value)
+            policy_metric_count += 1
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -539,6 +574,15 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
+            reduced_policy_metrics = {}
+            if policy_metric_count > 0:
+                for key in sorted(policy_metric_sums):
+                    local_average = torch.tensor(
+                        policy_metric_sums[key] / policy_metric_count,
+                        device=accelerator.device,
+                        dtype=torch.float32,
+                    )
+                    reduced_policy_metrics[key] = accelerator.reduce(local_average, reduction="mean").item()
             if is_main_process:
                 # Cluster-wide throughput, derived from the already-reduced (max) step time so it
                 # reflects the slowest rank — which is what actually gates the next iteration.
@@ -546,16 +590,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
+                if reduced_policy_metrics:
+                    metrics_text = " ".join(
+                        f"{key}:{value:.6f}" for key, value in reduced_policy_metrics.items()
+                    )
+                    logging.info("policy_metrics step:%d %s", step, metrics_text)
                 if wandb_logger:
                     wandb_log_dict = train_tracker.to_dict()
-                    if output_dict:
-                        wandb_log_dict.update(output_dict)
+                    wandb_log_dict.update(reduced_policy_metrics)
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+            policy_metric_sums.clear()
+            policy_metric_count = 0
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

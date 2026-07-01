@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GPU="${GPU:-0}"
+GPU="${GPU:-3}"
 STEPS="${STEPS:-20000}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 SAVE_FREQ="${SAVE_FREQ:-2000}"
 LOG_FREQ="${LOG_FREQ:-20}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/rxhuang/Projects/models/lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b1}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/rxhuang/Projects/models/lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b8}"
+PRETRAINED_PATH="${PRETRAINED_PATH:-}"
+OPTIMIZER_LR="${OPTIMIZER_LR:-1e-4}"
+SCHEDULER_DECAY_LR="${SCHEDULER_DECAY_LR:-1e-5}"
 LEROBOT_TRAIN="${LEROBOT_TRAIN:-/home/rxhuang/anaconda3/envs/lerobot/bin/lerobot-train}"
 
 INPUT_FEATURES='{
@@ -25,8 +28,14 @@ export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"
 export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-60}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 
+if [[ -n "${PRETRAINED_PATH}" ]]; then
+  POLICY_SOURCE=(--policy.path="${PRETRAINED_PATH}")
+else
+  POLICY_SOURCE=(--policy.type=giga_world)
+fi
+
 exec "${LEROBOT_TRAIN}" \
-  --policy.type=giga_world \
+  "${POLICY_SOURCE[@]}" \
   --policy.input_features="${INPUT_FEATURES}" \
   --dataset.repo_id=hrx2000/Three_Cubes_1 \
   --dataset.root=/data/rxhuang/three_cubes_1 \
@@ -52,8 +61,8 @@ exec "${LEROBOT_TRAIN}" \
   --policy.per_view_size='[256,192]' \
   --policy.chunk_size=48 \
   --policy.n_action_steps=16 \
-  --policy.optimizer_lr=1e-4 \
-  --policy.scheduler_decay_lr=1e-5 \
+  --policy.optimizer_lr="${OPTIMIZER_LR}" \
+  --policy.scheduler_decay_lr="${SCHEDULER_DECAY_LR}" \
   --policy.push_to_hub=false \
   --wandb.enable=false \
   --steps="${STEPS}" \

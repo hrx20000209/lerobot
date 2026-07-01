@@ -7,8 +7,8 @@ set -euo pipefail
 #   observation.images.front
 #   observation.images.wrist
 
-REPO_DIR="${REPO_DIR:-/home/hrx/Projects/lerobot}"
-PYTHON_BIN="${PYTHON_BIN:-/home/hrx/miniconda3/envs/lerobot/bin/python}"
+REPO_DIR="${REPO_DIR:-/home/rxhuang/Projects/lerobot}"
+PYTHON_BIN="${PYTHON_BIN:-/home/rxhuang/anaconda3/envs/lerobot/bin/python}"
 
 SERVER_ADDRESS="${SERVER_ADDRESS:-127.0.0.1:8080}"
 ROBOT_PORT="${ROBOT_PORT:-/dev/ttyACM1}"
@@ -27,9 +27,8 @@ CLIENT_DEVICE="${CLIENT_DEVICE:-cpu}"
 
 if [[ -z "${PRETRAINED_NAME_OR_PATH:-}" ]]; then
   CANDIDATE_CHECKPOINTS=(
-    "/home/hrx/Projects/models/three_cubes_1/giga_world"
-    "/home/hrx/Projects/models/lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b8/checkpoints/last/pretrained_model"
-    "/home/hrx/Projects/lerobot/output_lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b8/checkpoints/last/pretrained_model"
+    "/home/rxhuang/Projects/models/lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b8_padmask_ft/checkpoints/last/pretrained_model"
+    "/home/rxhuang/Projects/models/lerobot_train/three_cubes/giga_world_front_wrist_r64_w01_b8/checkpoints/last/pretrained_model"
   )
   PRETRAINED_NAME_OR_PATH="${CANDIDATE_CHECKPOINTS[0]}"
   for candidate in "${CANDIDATE_CHECKPOINTS[@]}"; do
@@ -40,15 +39,16 @@ if [[ -z "${PRETRAINED_NAME_OR_PATH:-}" ]]; then
   done
 fi
 
-# Giga World config defaults to chunk_size=48 and n_action_steps=16 in this repo.
-ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-16}"
+# At 30 Hz, all 48 actions cover 1.6 seconds. GigaWorld inference takes roughly
+# 1-2 seconds on a 4090D, so returning only 16 actions would starve the client queue.
+ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-48}"
 CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-1.0}"
 AGGREGATE_FN_NAME="${AGGREGATE_FN_NAME:-conservative}"
 
 TASK="${TASK:-go to red cube. take the red cube. go to box. put the red cube in box.}"
 DEBUG_VISUALIZE_QUEUE_SIZE="${DEBUG_VISUALIZE_QUEUE_SIZE:-True}"
 RECORD_TIMELINE="${RECORD_TIMELINE:-true}"
-TIMELINE_LOG_DIR="${TIMELINE_LOG_DIR:-/home/hrx/Projects/lerobot/logs/async_timeline}"
+TIMELINE_LOG_DIR="${TIMELINE_LOG_DIR:-/home/rxhuang/Projects/lerobot/logs/async_timeline}"
 TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-key}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then

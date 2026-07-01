@@ -51,6 +51,20 @@ def _torch_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported torch dtype: {name}")
 
 
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable(item) for item in value]
+    return value
+
+
 class GigaWorldPolicy(PreTrainedPolicy):
     config_class = GigaWorldConfig
     name = "giga_world"
@@ -110,13 +124,14 @@ class GigaWorldPolicy(PreTrainedPolicy):
         return super().from_pretrained(pretrained_name_or_path, config=config, **kwargs)
 
     def _save_pretrained(self, save_directory: Path) -> None:
+        norm_stats = self._normalization_stats_payload()
         old_transformer_path = self.config.transformer_path
         old_norm_stats_path = self.config.norm_stats_path
         try:
             if self.transformer is not None:
                 self.config.transformer_path = Path("transformer")
                 self.config.reinit_action_heads = False
-            if self._stats is not None:
+            if norm_stats is not None:
                 self.config.norm_stats_path = Path("giga_world_norm_stats.json")
             self.config._save_pretrained(save_directory)
         finally:
@@ -127,9 +142,9 @@ class GigaWorldPolicy(PreTrainedPolicy):
             transformer_dir = save_directory / "transformer"
             transformer_dir.mkdir(parents=True, exist_ok=True)
             self.transformer.save_pretrained(transformer_dir)
-        if self._stats is not None:
+        if norm_stats is not None:
             with open(save_directory / "giga_world_norm_stats.json", "w", encoding="utf-8") as f:
-                json.dump(self._stats, f, indent=2)
+                json.dump(norm_stats, f, indent=2)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -148,6 +163,15 @@ class GigaWorldPolicy(PreTrainedPolicy):
 
     def reset(self) -> None:
         self._action_queue.clear()
+
+    @torch.no_grad()
+    def prepare_for_inference(self, task: str = "") -> None:
+        """Load the lazy WAN, VAE, T5, and pipeline before the first robot observation."""
+        self.eval()
+        self._ensure_runtime(for_training=False)
+        self._ensure_pipeline()
+        if task:
+            self._encode_prompts([task])
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         self._ensure_runtime(for_training=True)
@@ -192,6 +216,7 @@ class GigaWorldPolicy(PreTrainedPolicy):
                 height=self._image_height,
                 width=self._image_width,
                 action_chunk=self.config.chunk_size,
+                action_dim=self.config.action_dim,
                 state=norm_state[idx].unsqueeze(0),
                 num_frames=self.config.num_inference_frames,
                 guidance_scale=self.config.guidance_scale,
@@ -484,7 +509,12 @@ class GigaWorldPolicy(PreTrainedPolicy):
             torch_dtype=self._dtype,
             cache_dir=self._model_cache_dir(),
         )
-        self.pipeline.to(self.device)
+        # The policy supplies prompt embeddings, so T5 can remain on its configured CPU device.
+        # Calling DiffusionPipeline.to() here would move the 5B transformer, VAE, and T5 onto one
+        # GPU and exceed a 24 GB card even though the inference working set itself fits.
+        self.pipeline.text_encoder = None
+        self.vae.to(device=self.device, dtype=self._dtype)
+        self.transformer.to(device=self.device, dtype=self._dtype)
 
     def _load_normalization_stats(self) -> dict[str, Any] | None:
         path = self._resolve_relative_to_checkpoint(_as_path(self.config.norm_stats_path))
@@ -492,6 +522,19 @@ class GigaWorldPolicy(PreTrainedPolicy):
             return None
         with open(path, encoding="utf-8") as f:
             return json.load(f)
+
+    def _normalization_stats_payload(self) -> dict[str, Any] | None:
+        if self._stats is not None:
+            return _jsonable(self._stats)
+        if self._dataset_stats is None:
+            return None
+
+        norm_stats = {}
+        for key in (self.config.state_key, self.config.action_key):
+            stats = self._dataset_stats.get(key)
+            if stats is not None:
+                norm_stats[key] = _jsonable(stats)
+        return {"norm_stats": norm_stats} if norm_stats else None
 
     def _stat_tensor(self, key: str, stat: str, dim: int, default: float) -> Tensor:
         source = None
@@ -540,6 +583,21 @@ class GigaWorldPolicy(PreTrainedPolicy):
         if action.shape[-1] < self.config.action_dim:
             action = F.pad(action, (0, self.config.action_dim - action.shape[-1]))
         return action
+
+    def _action_padding_mask(self, batch: dict[str, Any], action: Tensor) -> Tensor:
+        mask_value = batch.get("action_is_pad")
+        if mask_value is None:
+            mask = torch.zeros(action.shape[:2], dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(mask_value, dtype=torch.bool)
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0)
+            mask = mask[:, : self.config.chunk_size]
+            if mask.shape[1] < self.config.chunk_size:
+                mask = F.pad(mask, (0, self.config.chunk_size - mask.shape[1]), value=True)
+            if mask.shape[0] == 1 and action.shape[0] > 1:
+                mask = mask.expand(action.shape[0], -1)
+        return mask.to(self.device)
 
     def _normalize_state(self, state: Tensor) -> Tensor:
         mean = self._stat_tensor(self.config.state_key, "mean", self.config.state_dim, 0.0)
@@ -692,6 +750,7 @@ class GigaWorldPolicy(PreTrainedPolicy):
         ref_images[:, :1] = images[:, :1]
         state_raw = self._current_state(batch)
         action_raw = self._action_chunk(batch)
+        action_is_pad = self._action_padding_mask(batch, action_raw)
         state = self._normalize_state(state_raw).unsqueeze(1)
         action = self._normalize_action_delta(action_raw, state_raw)
         prompt_embeds = self._prompt_embeds(batch, batch_size=images.shape[0]).to(self.device)
@@ -700,6 +759,7 @@ class GigaWorldPolicy(PreTrainedPolicy):
             "ref_images": ref_images,
             "state": state,
             "action": action,
+            "action_is_pad": action_is_pad,
             "prompt_embeds": prompt_embeds,
         }
 
@@ -779,7 +839,9 @@ class GigaWorldPolicy(PreTrainedPolicy):
         )
 
         visual_loss = ((visual_pred.float() - visual_target.float()) * first_frame_mask).pow(2).mean()
-        action_loss = (action_pred.float() - action_target.float()).pow(2).mean()
+        action_squared_error = (action_pred.float() - action_target.float()).pow(2)
+        action_valid = (~batch["action_is_pad"]).unsqueeze(-1).expand_as(action_squared_error)
+        action_loss = (action_squared_error * action_valid).sum() / action_valid.sum().clamp_min(1)
         return {"visual_loss": visual_loss, "action_loss": action_loss}
 
     def _composite_pil_from_condition(self, image_seq: Tensor) -> Image.Image:
