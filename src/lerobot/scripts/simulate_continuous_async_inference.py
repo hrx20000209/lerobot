@@ -11,6 +11,7 @@ import queue
 import random
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -37,6 +38,7 @@ class SimulatedContinuousServer:
         action_dim: int,
         latency_mean: float,
         latency_jitter: float,
+        server_clock_offset: float = 0.0,
     ) -> None:
         self.event_logger = event_logger
         self.control_fps = control_fps
@@ -44,6 +46,7 @@ class SimulatedContinuousServer:
         self.action_dim = action_dim
         self.latency_mean = latency_mean
         self.latency_jitter = latency_jitter
+        self.server_clock_offset = server_clock_offset
         self.shutdown_event = threading.Event()
         self._condition = threading.Condition()
         self._latest_obs: TimedObservation | None = None
@@ -52,6 +55,9 @@ class SimulatedContinuousServer:
         self.results: queue.Queue[InferenceResult] = queue.Queue()
         self._inference_id = 0
         self.dropped = 0
+
+    def _server_now(self) -> float:
+        return monotonic_now() + self.server_clock_offset
 
     def start(self) -> None:
         self._worker.start()
@@ -63,7 +69,7 @@ class SimulatedContinuousServer:
         self._worker.join(timeout=2)
 
     def receive_observation(self, obs: TimedObservation) -> bool:
-        recv_ts = monotonic_now()
+        recv_ts = self._server_now()
         obs_id = obs.metadata["obs_id"]
         self.event_logger.record(
             "observation_received_by_server",
@@ -94,7 +100,7 @@ class SimulatedContinuousServer:
             if self._latest_obs is None:
                 return None
             obs = self._latest_obs
-            recv_ts = self._latest_recv_ts or monotonic_now()
+            recv_ts = self._latest_recv_ts or self._server_now()
             self._latest_obs = None
             self._latest_recv_ts = None
             return obs, recv_ts
@@ -108,7 +114,7 @@ class SimulatedContinuousServer:
             obs_id = int(obs.metadata["obs_id"])
             inference_id = self._inference_id
             self._inference_id += 1
-            start_ts = monotonic_now()
+            start_ts = self._server_now()
             self.event_logger.record(
                 "inference_started",
                 obs_id=obs_id,
@@ -119,7 +125,7 @@ class SimulatedContinuousServer:
             )
             latency = max(0.0, random.gauss(self.latency_mean, self.latency_jitter))
             time.sleep(latency)
-            end_ts = monotonic_now()
+            end_ts = self._server_now()
             base = torch.linspace(0.0, 1.0, self.chunk_size).unsqueeze(1)
             phase = obs_id / max(1.0, self.control_fps)
             action_chunk = [
@@ -139,7 +145,7 @@ class SimulatedContinuousServer:
             result = InferenceResult(
                 inference_id=inference_id,
                 source_obs_id=obs_id,
-                source_obs_capture_ts=float(obs.metadata["obs_capture_end_ts"]),
+                source_obs_capture_ts=float(obs.metadata["obs_capture_end_ts"]) + self.server_clock_offset,
                 source_obs_capture_wall_time=obs.metadata.get("wall_time_ts"),
                 inference_start_ts=start_ts,
                 inference_end_ts=end_ts,
@@ -153,7 +159,7 @@ class SimulatedContinuousServer:
                 "action_chunk_sent",
                 inference_id=inference_id,
                 source_obs_id=obs_id,
-                action_chunk_send_ts=monotonic_now(),
+                action_chunk_send_ts=self._server_now(),
                 action_chunk_size=self.chunk_size,
             )
 
@@ -168,11 +174,21 @@ def simulate(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         if path.exists():
             path.unlink()
     logger = StructuredEventLogger(log_path, enabled=True)
+    obs_local_capture_ts: OrderedDict[int, float] = OrderedDict()
+    obs_local_capture_ts_capacity = 256
+
+    def remember_obs(obs_id: int, capture_ts: float) -> None:
+        obs_local_capture_ts[obs_id] = capture_ts
+        obs_local_capture_ts.move_to_end(obs_id)
+        while len(obs_local_capture_ts) > obs_local_capture_ts_capacity:
+            obs_local_capture_ts.popitem(last=False)
+
     config = ContinuousAsyncConfig(
         continuous_obs_fps=args.observation_fps,
         control_fps=args.control_fps,
         aggregation_fn=args.aggregation_fn,
         stale_inference_max_age=args.stale_inference_max_age,
+        min_usable_actions=args.min_usable_actions,
         blend_horizon=args.blend_horizon,
         blend_alpha=args.blend_alpha,
         max_joint_delta=args.max_joint_delta,
@@ -187,15 +203,18 @@ def simulate(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         action_dim=args.action_dim,
         latency_mean=args.inference_latency_mean,
         latency_jitter=args.inference_latency_jitter,
+        server_clock_offset=args.server_clock_offset,
     )
 
     def capture(obs_id: int) -> TimedObservation:
+        capture_ts = monotonic_now()
+        remember_obs(obs_id, capture_ts)
         return TimedObservation(
             timestamp=wall_now(),
             timestep=obs_id,
             observation={"observation.state": torch.zeros(args.action_dim), "task": "dry-run"},
             must_go=True,
-            metadata={"obs_id": obs_id},
+            metadata={"obs_id": obs_id, "client_local_capture_ts": capture_ts},
         )
 
     publisher = ContinuousObservationPublisher(
@@ -214,6 +233,17 @@ def simulate(args: argparse.Namespace) -> tuple[Path, Path, Path]:
             except queue.Empty:
                 continue
             receive_ts = monotonic_now()
+            local_capture_ts = obs_local_capture_ts.get(result.source_obs_id)
+            if local_capture_ts is None:
+                logger.record(
+                    "inference_discarded",
+                    inference_id=result.inference_id,
+                    source_obs_id=result.source_obs_id,
+                    discard_reason="missing_client_capture_time",
+                )
+                continue
+            result.metadata["server_source_obs_capture_ts"] = result.source_obs_capture_ts
+            result.source_obs_capture_ts = local_capture_ts
             logger.record(
                 "action_chunk_received_by_client",
                 inference_id=result.inference_id,
@@ -269,12 +299,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference_latency_jitter", type=float, default=0.1)
     parser.add_argument(
         "--aggregation_fn",
-        choices=["replace_remaining", "splice_by_timestamp", "smooth_blend_remaining", "conservative_update"],
-        default="splice_by_timestamp",
+        choices=[
+            "latency_aligned_blend",
+            "replace_remaining",
+            "splice_by_timestamp",
+            "smooth_blend_remaining",
+            "conservative_update",
+        ],
+        default="latency_aligned_blend",
     )
     parser.add_argument("--stale_inference_max_age", type=float, default=2.0)
+    parser.add_argument("--min_usable_actions", type=int, default=5)
     parser.add_argument("--blend_horizon", type=int, default=5)
     parser.add_argument("--blend_alpha", type=float, default=0.5)
+    parser.add_argument("--server_clock_offset", type=float, default=0.0)
     parser.add_argument("--max_joint_delta", type=float, default=None)
     parser.add_argument("--max_gripper_delta", type=float, default=None)
     parser.add_argument("--max_joint_abs_range", type=float, default=None)

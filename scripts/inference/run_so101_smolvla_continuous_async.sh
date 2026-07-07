@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 REPO_DIR="${REPO_DIR:-/home/hrx/Projects/lerobot}"
 LEROBOT_DIR="${LEROBOT_DIR:-${REPO_DIR}/src}"
-PYTHON="${PYTHON:-/home/hrx/miniconda3/envs/cosmos/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/hrx/miniconda3/envs/lerobot/bin/python}"
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
@@ -29,7 +29,7 @@ TASK="${TASK:-go to red cube. take the red cube. go to box. put the red cube in 
 ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-50}"
 CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-1.0}"
 AGGREGATE_FN_NAME="${AGGREGATE_FN_NAME:-conservative}"
-CONTINUOUS_AGGREGATION_FN="${CONTINUOUS_AGGREGATION_FN:-conservative_update}"
+CONTINUOUS_AGGREGATION_FN="${CONTINUOUS_AGGREGATION_FN:-latency_aligned_blend}"
 FPS="${FPS:-30}"
 CONTINUOUS_OBS_FPS="${CONTINUOUS_OBS_FPS:-30}"
 OBS_QUEUE_TIMEOUT="${OBS_QUEUE_TIMEOUT:-0.05}"
@@ -43,7 +43,14 @@ RUN_SECONDS="${RUN_SECONDS:-8}"
 
 MAX_JOINT_DELTA="${MAX_JOINT_DELTA:-15}"
 MAX_GRIPPER_DELTA="${MAX_GRIPPER_DELTA:-15}"
+MAX_JOINT_DELTA_PER_STEP="${MAX_JOINT_DELTA_PER_STEP:-8}"
+MAX_GRIPPER_DELTA_PER_STEP="${MAX_GRIPPER_DELTA_PER_STEP:-12}"
 STALE_INFERENCE_MAX_AGE="${STALE_INFERENCE_MAX_AGE:-2.0}"
+MIN_USABLE_ACTIONS="${MIN_USABLE_ACTIONS:-5}"
+MAX_CONTROL_STEPS="${MAX_CONTROL_STEPS:-}"
+if [[ -z "${MAX_CONTROL_STEPS}" && "${ENABLE_ROBOT_EXECUTION}" =~ ^([Tt]rue|1|yes|YES)$ ]]; then
+  MAX_CONTROL_STEPS="5"
+fi
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG_ROOT="${LOG_ROOT:-/tmp/so101_smolvla_continuous_async}"
@@ -66,14 +73,14 @@ require_path() {
   fi
 }
 
-require_path "${PYTHON}"
+require_path "${PYTHON_BIN}"
 require_path "${ROBOT_PORT}"
 require_path "/dev/video${FRONT_CAMERA}"
 require_path "/dev/video${RIGHT_CAMERA}"
 require_path "/dev/video${WRIST_CAMERA}"
 require_path "${PRETRAINED_NAME_OR_PATH}"
 
-if "${PYTHON}" - <<PY
+if "${PYTHON_BIN}" - <<PY
 import socket
 s = socket.socket()
 s.settimeout(0.2)
@@ -95,7 +102,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "Starting continuous async policy server: ${SERVER_ADDRESS}"
-"${PYTHON}" -u -m lerobot.async_inference.continuous_policy_server \
+"${PYTHON_BIN}" -u -m lerobot.async_inference.continuous_policy_server \
   --host="${HOST}" \
   --port="${PORT}" \
   --fps="${FPS}" \
@@ -114,7 +121,7 @@ for _ in $(seq 1 120); do
     tail -80 "${SERVER_STDOUT_LOG}" >&2 || true
     exit 1
   fi
-  if "${PYTHON}" - <<PY
+  if "${PYTHON_BIN}" - <<PY
 import socket
 s = socket.socket()
 s.settimeout(0.2)
@@ -129,7 +136,7 @@ done
 ROBOT_CAMERAS="{ front: {type: opencv, index_or_path: ${FRONT_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"}, right: {type: opencv, index_or_path: ${RIGHT_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"}, wrist: {type: opencv, index_or_path: ${WRIST_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"} }"
 
 CLIENT_CMD=(
-  "${PYTHON}" -u -m lerobot.async_inference.continuous_robot_client
+  "${PYTHON_BIN}" -u -m lerobot.async_inference.continuous_robot_client
   --server_address="${SERVER_ADDRESS}"
   --robot.type=so101_follower
   --robot.port="${ROBOT_PORT}"
@@ -151,12 +158,19 @@ CLIENT_CMD=(
   --timeline_log_path="${TIMELINE_JSONL}"
   --timeline_plot_path="${TIMELINE_PNG}"
   --stale_inference_max_age="${STALE_INFERENCE_MAX_AGE}"
+  --min_usable_actions="${MIN_USABLE_ACTIONS}"
   --max_joint_delta="${MAX_JOINT_DELTA}"
   --max_gripper_delta="${MAX_GRIPPER_DELTA}"
+  --max_joint_delta_per_step="${MAX_JOINT_DELTA_PER_STEP}"
+  --max_gripper_delta_per_step="${MAX_GRIPPER_DELTA_PER_STEP}"
   --shadow_mode="${SHADOW_MODE}"
   --enable_robot_execution="${ENABLE_ROBOT_EXECUTION}"
   --debug_visualize_queue_size=True
 )
+
+if [[ -n "${MAX_CONTROL_STEPS}" ]]; then
+  CLIENT_CMD+=(--max_control_steps="${MAX_CONTROL_STEPS}")
+fi
 
 echo "Starting continuous async robot client. shadow_mode=${SHADOW_MODE} enable_robot_execution=${ENABLE_ROBOT_EXECUTION}"
 if [[ "${RUN_SECONDS}" == "0" ]]; then
@@ -175,7 +189,7 @@ if [[ -s "${TIMELINE_JSONL}" ]]; then
   if [[ "${PLOT_WINDOW_DURATION}" == "0" ]]; then
     PLOT_WINDOW_DURATION="8"
   fi
-  "${PYTHON}" -m lerobot.scripts.plot_async_timeline \
+  "${PYTHON_BIN}" -m lerobot.scripts.plot_async_timeline \
     --log_path "${TIMELINE_JSONL}" \
     --output_path "${TIMELINE_PNG}" \
     --window_start 0 \

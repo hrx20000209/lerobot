@@ -13,6 +13,7 @@ import logging
 import pickle  # nosec
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict
 from pprint import pformat
 from typing import Any
@@ -51,6 +52,7 @@ class ContinuousRobotClient(RobotClient):
             aggregation_fn=config.aggregation_fn,  # type: ignore[arg-type]
             max_pending_observations=config.max_pending_observations,
             stale_inference_max_age=config.stale_inference_max_age,
+            min_usable_actions=config.min_usable_actions,
             blend_horizon=config.blend_horizon,
             blend_alpha=config.blend_alpha,
             max_joint_delta=config.max_joint_delta,
@@ -74,9 +76,36 @@ class ContinuousRobotClient(RobotClient):
         )
         self._action_receiver_thread: threading.Thread | None = None
         self._action_executor_thread: threading.Thread | None = None
+        self._obs_local_capture_ts: OrderedDict[int, float] = OrderedDict()
+        self._obs_local_capture_ts_lock = threading.RLock()
+        self._obs_local_capture_ts_capacity = 256
+        self._last_commanded_action: torch.Tensor | None = None
+        self._last_sanitized_action: torch.Tensor | None = None
+        self._executed_control_steps = 0
+
+    def _remember_local_observation_time(self, obs_id: int, capture_ts: float) -> None:
+        with self._obs_local_capture_ts_lock:
+            self._obs_local_capture_ts[obs_id] = capture_ts
+            self._obs_local_capture_ts.move_to_end(obs_id)
+            while len(self._obs_local_capture_ts) > self._obs_local_capture_ts_capacity:
+                self._obs_local_capture_ts.popitem(last=False)
+
+    def _get_local_observation_time(self, obs_id: int) -> float | None:
+        with self._obs_local_capture_ts_lock:
+            value = self._obs_local_capture_ts.get(obs_id)
+            if value is not None:
+                self._obs_local_capture_ts.move_to_end(obs_id)
+            return value
 
     def _capture_continuous_observation(self, obs_id: int) -> TimedObservation:
         raw_observation: RawObservation = self.robot.get_observation()
+        if self._last_commanded_action is None:
+            try:
+                self._last_commanded_action = torch.tensor(
+                    [raw_observation[key] for key in self.robot.action_features], dtype=torch.float32
+                )
+            except KeyError:
+                self.logger.warning("Could not initialize action clamp state from observation keys")
         raw_observation["task"] = self.config.task
         if self.config.display_data:
             log_rerun_data(observation=raw_observation, compress_images=True)
@@ -87,12 +116,14 @@ class ContinuousRobotClient(RobotClient):
             mode=self.timeline_image_mode if self.config.record_timeline else "",
             key_frame=True,
         )
+        local_capture_ts = monotonic_now()
+        self._remember_local_observation_time(obs_id, local_capture_ts)
         return TimedObservation(
             timestamp=time.time(),
             observation=raw_observation,
             timestep=obs_id,
             must_go=True,
-            metadata={"obs_id": obs_id, "image_paths": image_paths},
+            metadata={"obs_id": obs_id, "image_paths": image_paths, "client_local_capture_ts": local_capture_ts},
         )
 
     def receive_actions_continuous(self) -> None:
@@ -107,6 +138,20 @@ class ContinuousRobotClient(RobotClient):
                 result = timed_actions_to_inference_result(timed_actions, default_receive_ts=receive_ts)
                 if result is None:
                     continue
+                local_capture_ts = self._get_local_observation_time(result.source_obs_id)
+                if local_capture_ts is None:
+                    self.event_logger.record(
+                        "inference_discarded",
+                        inference_id=result.inference_id,
+                        source_obs_id=result.source_obs_id,
+                        discard_reason="missing_client_capture_time",
+                    )
+                    continue
+                # Server monotonic timestamps are only meaningful on the server.
+                # Client-side queue alignment, stale checks, and latency logs must
+                # use this process's local monotonic clock.
+                result.metadata["server_source_obs_capture_ts"] = result.source_obs_capture_ts
+                result.source_obs_capture_ts = local_capture_ts
                 self.event_logger.record(
                     "action_chunk_received_by_client",
                     inference_id=result.inference_id,
@@ -129,6 +174,35 @@ class ContinuousRobotClient(RobotClient):
             and float(torch.max(torch.abs(action))) > self.config.max_joint_abs_range
         ):
             raise ValueError("Refusing to execute action outside max_joint_abs_range")
+        if self._last_commanded_action is not None:
+            previous = self._last_commanded_action
+            if action.shape != previous.shape:
+                raise ValueError(
+                    f"Refusing to execute action with shape {tuple(action.shape)} after {tuple(previous.shape)}"
+                )
+            delta = torch.abs(action - previous)
+            clipped = action.clone()
+            clipped_any = False
+            if self.config.max_joint_delta_per_step is not None and action.numel() > 1:
+                limit = float(self.config.max_joint_delta_per_step)
+                body_delta = torch.clamp(action[:-1] - previous[:-1], -limit, limit)
+                clipped[:-1] = previous[:-1] + body_delta
+                clipped_any = clipped_any or bool(torch.any(torch.abs(delta[:-1]) > limit))
+            if self.config.max_gripper_delta_per_step is not None and action.numel() > 0:
+                limit = float(self.config.max_gripper_delta_per_step)
+                gripper_delta = torch.clamp(action[-1] - previous[-1], -limit, limit)
+                clipped[-1] = previous[-1] + gripper_delta
+                clipped_any = clipped_any or bool(delta[-1] > limit)
+            if clipped_any:
+                self.event_logger.record(
+                    "action_step_clipped",
+                    max_delta_before=float(torch.max(delta)),
+                    max_delta_after=float(torch.max(torch.abs(clipped - previous))),
+                    max_joint_delta_per_step=self.config.max_joint_delta_per_step,
+                    max_gripper_delta_per_step=self.config.max_gripper_delta_per_step,
+                )
+                action = clipped
+        self._last_sanitized_action = action.detach().clone()
         return {key: action[i].item() for i, key in enumerate(self.robot.action_features)}
 
     def execute_actions_continuous(self) -> None:
@@ -151,6 +225,11 @@ class ContinuousRobotClient(RobotClient):
                         performed_action = {"shadow_mode": True, "commanded_action": commanded_action}
                     else:
                         performed_action = self.robot.send_action(commanded_action)
+                    self._last_commanded_action = (
+                        self._last_sanitized_action.detach().float().cpu()
+                        if self._last_sanitized_action is not None
+                        else item.action.detach().float().cpu()
+                    )
                     if self.config.display_data:
                         log_rerun_data(action=performed_action)
                 except Exception as exc:  # noqa: BLE001
@@ -163,6 +242,17 @@ class ContinuousRobotClient(RobotClient):
                         discard_reason=f"action_execution_rejected:{type(exc).__name__}",
                     )
                 self.queue_manager.finish_action_execution(item, performed_action=performed_action)
+                self._executed_control_steps += 1
+                if (
+                    self.config.max_control_steps is not None
+                    and self._executed_control_steps >= self.config.max_control_steps
+                ):
+                    self.event_logger.record(
+                        "max_control_steps_reached",
+                        executed_control_steps=self._executed_control_steps,
+                        max_control_steps=self.config.max_control_steps,
+                    )
+                    self.shutdown_event.set()
             elapsed = monotonic_now() - loop_start
             time.sleep(max(0.0, self.config.environment_dt - elapsed))
 

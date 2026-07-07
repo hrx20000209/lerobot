@@ -42,9 +42,10 @@ DISPLAY_DATA="${DISPLAY_DATA:-true}"
 RECORD_TIMELINE="${RECORD_TIMELINE:-true}"
 TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-key}"
 
-AGGREGATION_FN="${AGGREGATION_FN:-splice_by_timestamp}"
+AGGREGATION_FN="${AGGREGATION_FN:-latency_aligned_blend}"
 MAX_PENDING_OBSERVATIONS="${MAX_PENDING_OBSERVATIONS:-1}"
 STALE_INFERENCE_MAX_AGE="${STALE_INFERENCE_MAX_AGE:-2.0}"
+MIN_USABLE_ACTIONS="${MIN_USABLE_ACTIONS:-5}"
 BLEND_HORIZON="${BLEND_HORIZON:-5}"
 BLEND_ALPHA="${BLEND_ALPHA:-0.5}"
 MAX_JOINT_DELTA="${MAX_JOINT_DELTA:-}"
@@ -52,6 +53,7 @@ MAX_GRIPPER_DELTA="${MAX_GRIPPER_DELTA:-}"
 MAX_JOINT_DELTA_PER_STEP="${MAX_JOINT_DELTA_PER_STEP:-}"
 MAX_JOINT_ABS_RANGE="${MAX_JOINT_ABS_RANGE:-}"
 MAX_GRIPPER_DELTA_PER_STEP="${MAX_GRIPPER_DELTA_PER_STEP:-}"
+MAX_CONTROL_STEPS="${MAX_CONTROL_STEPS:-}"
 EMERGENCY_STOP="${EMERGENCY_STOP:-false}"
 
 SHADOW_MODE="${SHADOW_MODE:-true}"
@@ -99,6 +101,9 @@ fi
 if [[ -n "${MAX_GRIPPER_DELTA_PER_STEP}" ]]; then
   CONTINUOUS_SAFETY_ARGS+=(--max_gripper_delta_per_step="${MAX_GRIPPER_DELTA_PER_STEP}")
 fi
+if [[ -n "${MAX_CONTROL_STEPS}" ]]; then
+  CONTINUOUS_SAFETY_ARGS+=(--max_control_steps="${MAX_CONTROL_STEPS}")
+fi
 
 exec "${PYTHON_BIN}" -m lerobot.async_inference.continuous_robot_client \
   --async_mode=continuous \
@@ -119,6 +124,7 @@ exec "${PYTHON_BIN}" -m lerobot.async_inference.continuous_robot_client \
   --aggregation_fn="${AGGREGATION_FN}" \
   --max_pending_observations="${MAX_PENDING_OBSERVATIONS}" \
   --stale_inference_max_age="${STALE_INFERENCE_MAX_AGE}" \
+  --min_usable_actions="${MIN_USABLE_ACTIONS}" \
   --blend_horizon="${BLEND_HORIZON}" \
   --blend_alpha="${BLEND_ALPHA}" \
   "${CONTINUOUS_SAFETY_ARGS[@]}" \

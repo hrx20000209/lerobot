@@ -47,10 +47,10 @@ class ContinuousRobotClientConfig(RobotClientConfig):
     )
     continuous_obs_fps: float = field(default=30.0, metadata={"help": "Observation capture/send FPS."})
     aggregation_fn: str = field(
-        default="replace_remaining",
+        default="latency_aligned_blend",
         metadata={
-            "help": "Continuous queue aggregation: replace_remaining, splice_by_timestamp, "
-            "smooth_blend_remaining, conservative_update"
+            "help": "Continuous queue aggregation: latency_aligned_blend, replace_remaining, "
+            "splice_by_timestamp, smooth_blend_remaining, conservative_update"
         },
     )
     max_pending_observations: int = field(
@@ -65,6 +65,10 @@ class ContinuousRobotClientConfig(RobotClientConfig):
     )
     stale_inference_max_age: float = field(
         default=2.0, metadata={"help": "Reject inference results older than this."}
+    )
+    min_usable_actions: int = field(
+        default=5,
+        metadata={"help": "Minimum remaining actions required after latency alignment."},
     )
     blend_horizon: int = field(default=5, metadata={"help": "Actions to blend for smooth_blend_remaining."})
     blend_alpha: float = field(default=0.5, metadata={"help": "Old-action weight for smooth blending."})
@@ -82,6 +86,9 @@ class ContinuousRobotClientConfig(RobotClientConfig):
     )
     max_gripper_delta_per_step: float | None = field(
         default=None, metadata={"help": "Reserved gripper safety limit."}
+    )
+    max_control_steps: int | None = field(
+        default=None, metadata={"help": "Stop the continuous client after this many executed control steps."}
     )
     emergency_stop: bool = field(
         default=False, metadata={"help": "Reject queue updates and action execution."}
@@ -103,8 +110,6 @@ class ContinuousRobotClientConfig(RobotClientConfig):
         }
         if self.aggregation_fn in legacy_aggregate_map:
             self.aggregation_fn = legacy_aggregate_map[self.aggregation_fn]
-        elif self.aggregation_fn == "replace_remaining" and self.aggregate_fn_name in legacy_aggregate_map:
-            self.aggregation_fn = legacy_aggregate_map[self.aggregate_fn_name]
         if self.async_mode != "continuous":
             raise ValueError("ContinuousRobotClientConfig only supports async_mode='continuous'")
         if self.continuous_obs_fps <= 0:
@@ -114,9 +119,14 @@ class ContinuousRobotClientConfig(RobotClientConfig):
                 "continuous client uses latest-only observations; max_pending_observations must be 1"
             )
         if self.aggregation_fn not in {
+            "latency_aligned_blend",
             "replace_remaining",
             "splice_by_timestamp",
             "smooth_blend_remaining",
             "conservative_update",
         }:
             raise ValueError(f"Unknown continuous aggregation_fn: {self.aggregation_fn}")
+        if self.min_usable_actions < 0:
+            raise ValueError("min_usable_actions must be non-negative")
+        if self.max_control_steps is not None and self.max_control_steps <= 0:
+            raise ValueError("max_control_steps must be positive when set")

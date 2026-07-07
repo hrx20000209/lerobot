@@ -28,6 +28,7 @@ import torch
 from .helpers import TimedAction, TimedObservation
 
 ContinuousAggregationName = Literal[
+    "latency_aligned_blend",
     "replace_remaining",
     "splice_by_timestamp",
     "smooth_blend_remaining",
@@ -107,9 +108,10 @@ class ContinuousAsyncConfig:
     continuous_obs_fps: float = 30.0
     control_fps: float = 30.0
     continuous_inference_workers: int = 1
-    aggregation_fn: ContinuousAggregationName = "replace_remaining"
+    aggregation_fn: ContinuousAggregationName = "latency_aligned_blend"
     max_pending_observations: int = 1
     stale_inference_max_age: float = 2.0
+    min_usable_actions: int = 5
     blend_horizon: int = 5
     blend_alpha: float = 0.5
     max_joint_delta: float | None = None
@@ -317,7 +319,11 @@ class AsyncActionQueueManager:
                 self._finish_update_event(result, stats, first_pending_action_age)
                 return stats
 
-            if self.config.aggregation_fn == "replace_remaining":
+            if self.config.aggregation_fn == "latency_aligned_blend":
+                stats = self._latency_aligned_blend(
+                    result, old_pending, first_pending_action_age, source_obs_age
+                )
+            elif self.config.aggregation_fn == "replace_remaining":
                 stats = self._replace_remaining(result, old_pending, first_pending_action_age, source_obs_age)
             elif self.config.aggregation_fn == "splice_by_timestamp":
                 stats = self._splice_by_timestamp(
@@ -434,6 +440,63 @@ class AsyncActionQueueManager:
             first_pending_action_age=first_pending_action_age,
             source_obs_age=source_obs_age,
             update_reason=f"blend_horizon:{blend_count}",
+            mean_action_jump_before_update=sum(jumps_before) / len(jumps_before) if jumps_before else None,
+            mean_action_jump_after_update=sum(jumps_after) / len(jumps_after) if jumps_after else None,
+        )
+
+    def _latency_aligned_blend(
+        self,
+        result: InferenceResult,
+        old_pending: list[ActionQueueItem],
+        first_pending_action_age: float | None,
+        source_obs_age: float | None,
+    ) -> QueueUpdateStats:
+        # source_obs_capture_ts must have been rewritten by the client to its own
+        # local monotonic clock before this method is called. Server monotonic
+        # timestamps are not comparable across processes or machines.
+        offset = int(round((monotonic_now() - result.source_obs_capture_ts) * self.config.control_fps))
+        offset = max(0, offset)
+        min_usable = max(0, int(self.config.min_usable_actions))
+        if offset >= result.action_chunk_size - min_usable:
+            return self._discard(
+                result, f"chunk_too_stale:offset={offset}", len(old_pending), source_obs_age
+            )
+
+        new_items = self._new_items(result, start_chunk_index=offset)
+        blend_count = min(self.config.blend_horizon, len(old_pending), len(new_items))
+        jumps_before = []
+        jumps_after = []
+        for i in range(blend_count):
+            w_old = self.config.blend_alpha * (1.0 - (i + 1) / (blend_count + 1))
+            old_action = old_pending[i].action
+            new_action = new_items[i].action
+            blended = w_old * old_action + (1.0 - w_old) * new_action
+            jumps_before.append(_action_max_abs_delta(old_action, new_action))
+            jumps_after.append(_action_max_abs_delta(old_action, blended))
+            new_items[i].action = blended
+            new_items[i].metadata.update(
+                {
+                    "blended": True,
+                    "w_old": w_old,
+                    "latency_offset_steps": offset,
+                    "action_jump_before_update": jumps_before[-1],
+                    "action_jump_after_update": jumps_after[-1],
+                }
+            )
+
+        self._mark_replaced(old_pending, result)
+        self._pending = new_items
+        return QueueUpdateStats(
+            applied=True,
+            aggregation_fn="latency_aligned_blend",
+            old_queue_length=len(old_pending),
+            new_queue_length=len(self._pending),
+            num_actions_replaced=len(old_pending),
+            num_actions_blended=blend_count,
+            num_actions_dropped=offset,
+            first_pending_action_age=first_pending_action_age,
+            source_obs_age=source_obs_age,
+            update_reason=f"offset={offset},blend={blend_count}",
             mean_action_jump_before_update=sum(jumps_before) / len(jumps_before) if jumps_before else None,
             mean_action_jump_after_update=sum(jumps_after) / len(jumps_after) if jumps_after else None,
         )
@@ -609,7 +672,19 @@ class ContinuousObservationPublisher:
                 continue
             obs_send_ts = monotonic_now()
             obs.metadata["obs_send_ts"] = obs_send_ts
-            sent = self.send_fn(obs)
+            try:
+                sent = self.send_fn(obs)
+            except Exception as exc:  # noqa: BLE001
+                self.event_logger.record(
+                    "observation_send_failed",
+                    obs_id=obs.metadata.get("obs_id"),
+                    obs_send_ts=obs_send_ts,
+                    error=f"{type(exc).__name__}: {exc}",
+                    dropped_observation_count=self.dropped_observation_count,
+                )
+                if self.shutdown_event.is_set() or "Client not running" in str(exc):
+                    break
+                raise
             self.event_logger.record(
                 "observation_sent",
                 obs_id=obs.metadata.get("obs_id"),

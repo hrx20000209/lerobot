@@ -14,6 +14,7 @@ import pickle  # nosec
 import queue
 import threading
 import time
+import inspect
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
@@ -46,6 +47,7 @@ class ContinuousInferenceServer(PolicyServer):
         self._result_queue: queue.Queue[list] = queue.Queue(maxsize=2)
         self._worker_started = False
         self._dropped_observation_count = 0
+        self._continuous_policy_state: Any = None
 
     def _reset_server(self) -> None:
         super()._reset_server()
@@ -53,10 +55,18 @@ class ContinuousInferenceServer(PolicyServer):
             self._latest_observation = None
             self._latest_observation_recv_ts = None
             self._obs_condition.notify_all()
+        if self._inference_thread is not None:
+            self._inference_thread.join(timeout=2)
+        self._inference_thread = None
+        self._worker_started = False
+        self._inference_id = 0
+        self._dropped_observation_count = 0
         self._result_queue = queue.Queue(maxsize=2)
+        self._reset_continuous_policy_state()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         response = super().SendPolicyInstructions(request, context)
+        self._reset_continuous_policy_state()
         self._start_inference_worker()
         return response
 
@@ -66,6 +76,54 @@ class ContinuousInferenceServer(PolicyServer):
         self._worker_started = True
         self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
         self._inference_thread.start()
+
+    def _supports_continuous_policy_state(self) -> bool:
+        return bool(getattr(self.policy, "supports_continuous_state", False))
+
+    def _reset_continuous_policy_state(self) -> None:
+        self._continuous_policy_state = None
+        if not self._supports_continuous_policy_state():
+            return
+        reset = getattr(self.policy, "reset_continuous_inference_state", None)
+        if callable(reset):
+            self._continuous_policy_state = reset()
+            return
+        initializer = getattr(self.policy, "init_continuous_inference_state", None)
+        if callable(initializer):
+            self._continuous_policy_state = initializer()
+
+    def _get_action_chunk(self, observation):  # noqa: ANN001
+        if not self._supports_continuous_policy_state():
+            return super()._get_action_chunk(observation)
+
+        method = getattr(self.policy, "predict_action_chunk_continuous", None)
+        if not callable(method):
+            return super()._get_action_chunk(observation)
+
+        kwargs = {}
+        try:
+            parameters = inspect.signature(method).parameters
+            if "state" in parameters:
+                kwargs["state"] = self._continuous_policy_state
+            elif "continuous_state" in parameters:
+                kwargs["continuous_state"] = self._continuous_policy_state
+        except (TypeError, ValueError):
+            pass
+
+        output = method(observation, **kwargs)
+        if isinstance(output, tuple) and len(output) == 2:
+            action_chunk, self._continuous_policy_state = output
+        elif isinstance(output, dict):
+            action_chunk = output.get("actions", output.get("action_chunk"))
+            self._continuous_policy_state = output.get(
+                "state", output.get("continuous_state", self._continuous_policy_state)
+            )
+        else:
+            action_chunk = output
+
+        if action_chunk.ndim != 3:
+            action_chunk = action_chunk.unsqueeze(0)
+        return action_chunk[:, : self.actions_per_chunk, :]
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         receive_start_ts = monotonic_now()
