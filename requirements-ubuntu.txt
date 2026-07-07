@@ -136,7 +136,7 @@ decorator==5.2.1
     # via ipython
 deepdiff==8.6.1
     # via lerobot
-diffusers==0.35.2
+diffusers==0.36.0
     # via lerobot
 dill==0.4.0
     # via

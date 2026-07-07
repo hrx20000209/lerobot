@@ -180,6 +180,14 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    display_data: bool = field(
+        default=False,
+        metadata={"help": "Stream robot observations and executed actions to Rerun"},
+    )
+    display_ip: str | None = field(default=None, metadata={"help": "Optional Rerun server IP"})
+    display_port: int | None = field(
+        default=None, metadata={"help": "Optional Rerun server gRPC port"}
+    )
     record_timeline: bool = field(
         default=False,
         metadata={"help": "Record async inference timeline events for plotting"},
@@ -267,6 +275,9 @@ class RobotClientConfig:
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "display_data": self.display_data,
+            "display_ip": self.display_ip,
+            "display_port": self.display_port,
             "aggregate_fn_name": self.aggregate_fn_name,
             "record_timeline": self.record_timeline,
             "timeline_log_dir": self.timeline_log_dir,

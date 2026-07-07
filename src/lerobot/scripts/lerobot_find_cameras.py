@@ -248,40 +248,27 @@ def save_images_from_all_cameras(
         logger.warning("No cameras detected matching the criteria. Cannot save images.")
         return
 
-    cameras_to_use = []
-    for cam_meta in all_camera_metadata:
-        camera_instance = create_camera_instance(cam_meta)
-        if camera_instance:
-            cameras_to_use.append(camera_instance)
-
-    if not cameras_to_use:
-        logger.warning("No cameras could be connected. Aborting image save.")
-        return
-
-    logger.info(f"Starting image capture for {record_time_s} seconds from {len(cameras_to_use)} cameras.")
-    start_time = time.perf_counter()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(cameras_to_use) * 2) as executor:
-        try:
-            while time.perf_counter() - start_time < record_time_s:
-                futures = []
-                current_capture_time = time.perf_counter()
-
-                for cam_dict in cameras_to_use:
-                    future = process_camera_image(cam_dict, output_dir, current_capture_time)
-                    if future:
-                        futures.append(future)
-
-                if futures:
-                    concurrent.futures.wait(futures)
-
-        except KeyboardInterrupt:
-            logger.info("Capture interrupted by user.")
-        finally:
-            print("\nFinalizing image saving...")
-            executor.shutdown(wait=True)
-            cleanup_cameras(cameras_to_use)
-            print(f"Image capture finished. Images saved to {output_dir}")
+    # Probe and capture sequentially. Keeping every UVC camera streaming at its
+    # default (often uncompressed YUYV) profile can exhaust a shared USB 2.0
+    # controller and surface as VIDIOC_STREAMON "No space left on device".
+    connected_count = 0
+    try:
+        for cam_meta in all_camera_metadata:
+            camera_instance = create_camera_instance(cam_meta)
+            if camera_instance is None:
+                continue
+            connected_count += 1
+            try:
+                process_camera_image(camera_instance, output_dir, time.perf_counter())
+            finally:
+                cleanup_cameras([camera_instance])
+    except KeyboardInterrupt:
+        logger.info("Capture interrupted by user.")
+    finally:
+        print("\nFinalizing image saving...")
+        if connected_count == 0:
+            logger.warning("No cameras could be connected.")
+        print(f"Image capture finished. Images saved to {output_dir}")
 
 
 def main():

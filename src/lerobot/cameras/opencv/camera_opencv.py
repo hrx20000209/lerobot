@@ -155,7 +155,10 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        # Draccus deserializes filesystem camera identifiers as pathlib.Path,
+        # while OpenCV 4.8 accepts only an integer index or a plain string.
+        capture_target = str(self.index_or_path) if isinstance(self.index_or_path, Path) else self.index_or_path
+        self.videocapture = cv2.VideoCapture(capture_target, self.backend)
 
         if not self.videocapture.isOpened():
             self.videocapture.release()
@@ -316,12 +319,21 @@ class OpenCVCamera(Camera):
         targets_to_scan: list[str | int]
         if platform.system() == "Linux":
             possible_paths = sorted(Path("/dev").glob("video*"), key=lambda p: p.name)
-            targets_to_scan = [str(p) for p in possible_paths]
+            targets_to_scan = []
+            for path in possible_paths:
+                # UVC devices commonly expose index 0 as the capture stream and
+                # index 1 as a metadata-only node. Avoid opening metadata nodes,
+                # which produces noisy VIDIOC errors in FFmpeg/OpenCV.
+                sysfs_index = Path("/sys/class/video4linux") / path.name / "index"
+                if sysfs_index.exists() and sysfs_index.read_text().strip() != "0":
+                    continue
+                targets_to_scan.append(str(path))
         else:
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
+            backend = cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_ANY
+            camera = cv2.VideoCapture(target, backend)
             if camera.isOpened():
                 default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
                 default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))

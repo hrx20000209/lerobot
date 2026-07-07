@@ -1,0 +1,332 @@
+你在训练服务器上负责修复并重新训练 LeRobot 的 GigaWorld three-cubes policy。不要只分析或给建议，要实际检查代码、实现修复、运行测试、训练模型并根据验证指标迭代。
+
+固定要求：
+
+- 使用 conda 环境：lerobot
+- 数据集绝对路径：/data/rxhuang/three_cubes_1
+- LeRobot 仓库预计位于：/home/rxhuang/Projects/lerobot
+- GigaWorld 源码预计位于：/home/rxhuang/Projects/giga-world-policy
+- 不要覆盖或删除现有 checkpoint。
+- 新模型保存到独立目录，例如：
+  /home/rxhuang/Projects/models/three_cubes_1/giga_world_delta_v2
+- 不要上传模型或数据到 Hugging Face Hub。
+
+开始前先执行并记录：
+
+1. conda activate lerobot
+2. which python
+3. python --version
+4. nvidia-smi
+5. 检查实际仓库、数据集、模型缓存和已有checkpoint路径。
+6. 检查git status，保留用户已有修改，不要破坏无关代码。
+
+背景和已确认的问题：
+
+1. 数据集是 SO-101、30 Hz、6维绝对关节位置，顺序严格为：
+
+   shoulder_pan.pos
+   shoulder_lift.pos
+   elbow_flex.pos
+   wrist_flex.pos
+   wrist_roll.pos
+   gripper.pos
+
+2. 当前GigaWorld配置大致为：
+
+   - action_dim=6
+   - state_dim=6
+   - chunk_size=48
+   - n_action_steps原始值为16
+   - num_inference_steps=10
+   - 前5个关节使用delta action
+   - gripper使用absolute action
+   - delta mask应为：
+     [true, true, true, true, true, false]
+
+3. 当前外部LeRobot preprocessor/postprocessor是Identity。state/action归一化在GigaWorld policy内部完成。
+
+4. 当前训练代码先执行：
+
+   delta_action = target_action - current_state
+
+   但随后错误地使用absolute action的mean/std来归一化delta action。
+
+5. 在/data/rxhuang/three_cubes_1上，当前训练目标经过这种错误处理后的均值和标准差约为：
+
+   pan:          0.894 ± 0.108
+   lift:         0.321 ± 0.094
+   elbow:       -0.369 ± 0.106
+   wrist_flex:  -6.261 ± 0.174
+   wrist_roll:  -1.579 ± 0.104
+   gripper:      0.000 ± 1.000
+
+   wrist_flex训练目标全部位于约-6.26 sigma，说明delta action使用了错误的absolute action统计量。这是本次重训必须修复的首要问题。
+
+6. 不允许只修改推理端后继续使用旧checkpoint。旧checkpoint已经学习了错误表示，必须重新训练。
+
+7. 当前离线评估通常使用10个diffusion steps，但Jetson Thor真机为了延迟曾使用5 steps。前144帧中：
+
+   - 10-step平均关节MAE约4.00度
+   - 5-step平均关节MAE约4.64度
+   - shoulder_lift MAE约从6.00度增加到9.20度
+
+8. 真机测试中模型可以移动到红块附近，但没有稳定抓取和放置。夹爪动作不足，闭环误差不断累积。
+
+9. 离线dataset replay始终输入expert图像和expert state，属于teacher-forced评估，不能证明闭环稳定性。
+
+任务一：审计当前实现
+
+重点检查：
+
+- /home/rxhuang/Projects/lerobot/src/lerobot/policies/giga_world/
+- /home/rxhuang/Projects/giga-world-policy/world_action_model/
+- LeRobot训练入口和dataset delta timestamp构造。
+- GigaWorld训练batch preparation。
+- state normalization。
+- delta action构造。
+- action normalization和denormalization。
+- inference时add-state-back逻辑。
+- delta mask。
+- action padding mask。
+- checkpoint保存和重新加载。
+- WAN transformer、LoRA和action head权重是否完整保存。
+
+必须画出并记录当前代码实际产生的：
+
+- raw absolute action分布
+- action-state delta分布
+- 当前normalized delta分布
+- 每个关节min/max/mean/std/q01/q10/q50/q90/q99
+
+确认训练和推理使用完全相同的：
+
+- action表示
+- delta mask
+- normalization stats
+- action/state维度
+- camera key和顺序
+- action关节顺序
+
+任务二：正确实现delta action统计量
+
+目标表示：
+
+- 前5个关节：delta_action = target_action - current_state
+- gripper：保持absolute target_action
+- mask：[true, true, true, true, true, false]
+
+必须基于转换后的混合action表示重新计算统计量：
+
+hybrid_action[..., 0:5] = action[..., 0:5] - state[..., 0:5]
+hybrid_action[..., 5] = action[..., 5]
+
+然后使用hybrid_action自己的统计量进行归一化。
+
+优先比较：
+
+A. 当前错误baseline：delta action + absolute stats
+B. 修复方案：delta/hybrid action + MEAN_STD
+C. delta/hybrid action + robust quantile normalization
+D. absolute action baseline，不使用delta
+
+不要预先假定哪一个最好。先计算分布并运行小规模训练，用物理角度误差选择方案。
+
+实现要求：
+
+- stats必须明确标注它们对应absolute action还是delta/hybrid action。
+- 建议保存独立键或独立文件，例如：
+  action_representation: delta_hybrid
+  delta_mask: [true,true,true,true,true,false]
+  normalization_mode: mean_std
+- 禁止继续把absolute action stats误当作delta stats。
+- checkpoint必须携带正确stats并可自动重新加载。
+- 训练、离线评估、policy server和真机推理必须走同一套转换逻辑。
+- 编写round-trip测试：
+  physical action -> delta/hybrid -> normalize -> denormalize -> add state
+  输出必须恢复原始physical action。
+- 覆盖batch、chunk、padding和6维action测试。
+- 测试每个关节，不能只测试整体shape。
+
+任务三：检查图像和时序条件
+
+- 数据集频率固定为30 Hz。
+- chunk_size保持48作为首选，因为48步在30 Hz下覆盖1.6秒，能够覆盖Thor上的GigaWorld推理延迟。
+- 比较n_action_steps=16和48，但部署候选必须解释为什么不会造成action queue断流。
+- 确认训练输入没有错误使用未来观测作为当前policy不可获得的条件。
+- 确认多帧输入的offset语义。若训练使用历史帧，offset必须是合法历史，不得在真机推理时用重复当前帧冒充训练所需的未来帧。
+- 确认front和wrist视角的顺序、resize、crop、RGB范围以及[-1,1]图像归一化在训练和推理中一致。
+- 输出训练图像和推理图像经过预处理后的可视化对比。
+
+任务四：数据集划分
+
+必须按episode划分，不能随机拆分frame：
+
+- train：80 episodes
+- validation：10 episodes
+- test：10 episodes
+- 使用固定seed。
+- 把具体episode编号保存到JSON和最终报告。
+- 禁止同一个episode同时出现在train和validation/test。
+
+检查所有episode的初始姿态分布，并在评估中单独报告：
+
+- in-distribution start
+- start pose边缘样本
+- 明显out-of-distribution start
+
+任务五：建立可重复baseline
+
+在修改训练表示前，先用旧checkpoint和当前代码生成baseline：
+
+- 至少评估episode 0和多个held-out episodes。
+- 保存prediction vs GT vs observation.state曲线。
+- 保存原始normalized action。
+- 保存反归一化后的physical action。
+- 记录10-step和5-step结果。
+- 设置随机seed并记录多次采样均值/标准差。
+
+不要只说曲线“看起来接近”。必须计算物理单位指标。
+
+任务六：训练策略
+
+分阶段执行：
+
+1. 完成数据分布和代码审计。
+2. 实现delta/hybrid stats及单元测试。
+3. 运行500到1000 steps smoke training。
+4. smoke training必须确认：
+   - action loss稳定下降
+   - normalized target分布合理
+   - wrist_flex不再集中在-6.26 sigma
+   - checkpoint保存和加载一致
+   - 固定样本physical action误差开始下降
+5. smoke通过后再进行完整训练。
+6. 定期保存checkpoint并运行validation。
+7. 不要只使用last checkpoint，按validation physical-action metric选择best checkpoint。
+
+充分使用服务器GPU：
+
+- 在lerobot环境中运行。
+- 使用bf16。
+- 根据GPU数量使用accelerate或torch distributed。
+- 合理设置batch size、gradient accumulation和dataloader workers。
+- 监控GPU显存、利用率、CPU内存和训练吞吐量。
+- 固定并记录所有随机seed。
+- 不要为了吞吐量改变30 Hz动作语义。
+
+检查以下训练超参数：
+
+- learning rate
+- warmup steps
+- total steps
+- action_loss_weight
+- visual_loss_weight
+- LoRA rank/alpha
+- action head是否完整训练
+- transformer backbone冻结范围
+- gradient clipping
+- num_inference_steps
+
+必须做至少一个消融，判断visual/world loss是否损害action精度。若action任务优先，可以比较降低visual_loss_weight或action-only训练阶段。
+
+任务七：离线评估要求
+
+必须输出：
+
+1. 每关节MAE和RMSE，单位为degree。
+2. 每个chunk内第1、4、8、16、32、48步误差。
+3. 每个任务阶段误差：
+   - 接近红块
+   - 对准和抓取
+   - 移动到箱子
+   - 放置
+4. normalized action min/max/mean/std。
+5. normalized action超过|3|和触及边界的比例。
+6. physical action范围。
+7. action-state delta范围。
+8. 相邻action跳变的max、p99和均值。
+9. chunk边界跳变。
+10. 5-step和10-step推理对比。
+11. 多次随机采样方差。
+12. 保存前和重新加载后输出一致性。
+
+至少生成：
+
+- prediction vs GT vs state图
+- 每关节误差图
+- normalized target分布图
+- absolute stats与delta stats对比图
+- chunk boundary jump图
+- 训练/验证loss图
+- 5-step vs 10-step对比图
+
+任务八：验收标准
+
+最低要求：
+
+- wrist_flex normalized target分布不再异常集中在-6.26附近。
+- 所有delta关节normalized target均值应接近0，尺度合理；若使用MEAN_STD，std应接近1。
+- round-trip误差接近浮点误差。
+- held-out test主要关节平均physical MAE目标小于3度。
+- 抓取阶段gripper误差必须单独报告，并明显优于旧checkpoint。
+- normalized action没有异常大值或NaN/Inf。
+- 重新加载checkpoint后输出与保存前一致。
+- checkpoint包含正确的delta/hybrid stats和delta mask。
+- 48步输出shape严格为[batch,48,6]。
+- 10-step候选必须达到质量要求。
+- 如果5-step质量显著下降，明确禁止部署脚本默认使用5-step。
+
+如果达不到指标，不要宣称训练成功。继续检查：
+
+- delta stats是否确实由delta数据计算
+- active checkpoint是否加载正确action head和LoRA
+- action/state维度是否正确
+- 多视角顺序是否正确
+- flow target和denoising方向是否正确
+- visual loss是否干扰action learning
+- action head是否欠拟合
+- 训练步数是否不足
+- start pose分布是否过窄
+- 数据集是否存在异常episode或action outlier
+
+任务九：部署配置建议
+
+最终为Jetson Thor给出明确参数：
+
+- checkpoint路径
+- actions_per_chunk
+- n_action_steps
+- num_inference_steps
+- client FPS
+- queue threshold
+- RTC enabled/disabled
+- execution horizon
+- aggregation方式
+- max_relative_target安全值
+- start pose允许范围
+
+部署建议必须基于测得的推理延迟和chunk覆盖时间：
+
+chunk coverage = actions_per_chunk / 30 Hz
+
+推理延迟必须小于可用queue覆盖时间，并留出安全余量。
+
+任务十：最终交付
+
+完成后提供：
+
+1. 所有修改文件及原因。
+2. 完整训练命令。
+3. 使用的lerobot环境信息。
+4. 最终checkpoint绝对路径。
+5. train/validation/test episode划分JSON。
+6. absolute action和delta/hybrid action统计量。
+7. 新旧checkpoint完整指标对比。
+8. 5-step和10-step对比。
+9. 所有图表路径。
+10. 单元测试和集成测试结果。
+11. checkpoint保存/加载一致性结果。
+12. Jetson Thor部署命令。
+13. 一份完整Markdown报告。
+
+不要只完成代码修改后就停止。必须运行测试、smoke training、完整训练和held-out评估，并根据指标选择最终checkpoint。

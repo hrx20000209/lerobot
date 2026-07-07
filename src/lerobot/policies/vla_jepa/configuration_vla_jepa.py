@@ -29,6 +29,18 @@ class VLAJEPAConfig(PreTrainedConfig):
     chunk_size: int = 7
     n_action_steps: int = 7
 
+    # Temporal sampling used while constructing training examples.  Older
+    # checkpoints sampled future frames; deployable checkpoints use history so
+    # every visual condition is available causally at inference time.
+    observation_temporal_mode: str = "future"
+
+    # Optional hybrid relative-action representation.  The mask selects joints
+    # represented relative to observation.state; unmasked joints (typically the
+    # gripper) remain absolute.
+    use_relative_actions: bool = False
+    relative_action_mask: list[bool] | None = None
+    normalization_stats_path: str | None = None
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -107,6 +119,10 @@ class VLAJEPAConfig(PreTrainedConfig):
             self.enable_world_model = False
         if self.n_action_steps > self.chunk_size:
             raise ValueError("`n_action_steps` must be <= `chunk_size`.")
+        if self.observation_temporal_mode not in {"future", "history", "current"}:
+            raise ValueError(
+                "`observation_temporal_mode` must be one of: future, history, current."
+            )
         if self.num_video_frames < 2 * self.jepa_tubelet_size:
             raise ValueError(
                 f"`video_horizon` ({self.num_video_frames}) must be >= 2 * `jepa_tubelet_size` "
@@ -141,8 +157,11 @@ class VLAJEPAConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        # load video_horizon frames starting from current timestep: [t, t+1, ..., t+video_horizon-1]
-        # matches original repo's observation_indices=list(range(video_horizon))
+        if self.observation_temporal_mode == "history":
+            return list(range(1 - self.num_video_frames, 1))
+        if self.observation_temporal_mode == "current":
+            return [0]
+        # Legacy behavior: [t, t+1, ..., t+video_horizon-1].
         return list(range(self.num_video_frames))
 
     @property

@@ -159,6 +159,20 @@ class VLAJEPAModel(nn.Module):
 
         return captured[0]  # [B, seq_len, H]
 
+    @staticmethod
+    def _active_modules_to_save(module: nn.Module) -> nn.Module:
+        """Return PEFT's active saved module when a full submodule is wrapped.
+
+        ``ModulesToSaveWrapper`` forwards ``forward`` but not custom methods
+        such as ``predict_action``. VLA-JEPA stores its complete action head in
+        this wrapper, so inference must select the active adapter copy.
+        """
+        modules_to_save = getattr(module, "modules_to_save", None)
+        active_adapter = getattr(module, "active_adapter", None)
+        if modules_to_save is not None and active_adapter in modules_to_save:
+            return modules_to_save[active_adapter]
+        return module
+
     # ---- Native VLA-JEPA forward (follows original VLA_JEPA.py) ----
 
     def forward(self, examples: list[dict]) -> dict[str, Tensor]:
@@ -374,7 +388,8 @@ class VLAJEPAModel(nn.Module):
                 device=last_hidden.device, dtype=last_hidden.dtype
             )
 
-        pred_actions = self.action_model.predict_action(
+        action_model = self._active_modules_to_save(self.action_model)
+        pred_actions = action_model.predict_action(
             embodied_action_tokens.float(), state_tensor.float() if state_tensor is not None else None
         )  # [B, action_horizon, action_dim]
 

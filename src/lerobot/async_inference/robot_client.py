@@ -65,6 +65,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
 from .configs import RobotClientConfig
 from .helpers import (
@@ -511,9 +512,8 @@ class RobotClient:
 
         execution_start_time = time.time()
         send_start = time.perf_counter()
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        commanded_action = self._action_tensor_to_action_dict(timed_action.get_action())
+        _performed_action = self.robot.send_action(commanded_action)
         execution_end_time = time.time()
         send_action_time = time.perf_counter() - send_start
         with self.latest_action_lock:
@@ -555,7 +555,11 @@ class RobotClient:
             inference_end_time=inference_end_time,
             queue_size_before=queue_size_before_pop,
             queue_size_after=queue_size_after_pop,
+            commanded_action=commanded_action,
+            performed_action=_performed_action,
         )
+        if self.config.display_data:
+            log_rerun_data(action=_performed_action)
 
         if verbose:
             with self.action_queue_lock:
@@ -586,6 +590,9 @@ class RobotClient:
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
+
+            if self.config.display_data:
+                log_rerun_data(observation=raw_observation, compress_images=True)
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -711,6 +718,9 @@ class RobotClient:
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
+    if cfg.display_data:
+        init_rerun(session_name="async_inference", ip=cfg.display_ip, port=cfg.display_port)
+
     # TODO: Assert if checking robot support is still needed with the plugin system
     # if cfg.robot.type not in SUPPORTED_ROBOTS:
     #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
@@ -735,9 +745,13 @@ def async_client(cfg: RobotClientConfig):
             action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
+            if cfg.display_data:
+                shutdown_rerun()
             client.logger.info("Client stopped")
     else:
         client.stop()
+        if cfg.display_data:
+            shutdown_rerun()
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--second-camera-key", default="observation.images.right")
     parser.add_argument("--second-camera-policy-key", default="observation.images.wrist")
     parser.add_argument("--out", type=Path, required=True)
@@ -46,10 +47,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_policy(model_path: Path, device: str):
+def load_policy(model_path: Path, device: str, num_inference_steps: int | None = None):
     cfg = PreTrainedConfig.from_pretrained(model_path)
     cfg.pretrained_path = model_path
     cfg.device = device
+    if num_inference_steps is not None:
+        if not hasattr(cfg, "num_inference_steps"):
+            raise ValueError(f"{cfg.type} does not expose num_inference_steps")
+        cfg.num_inference_steps = num_inference_steps
 
     policy_cls = get_policy_class(cfg.type)
     if cfg.use_peft:
@@ -197,7 +202,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s %(message)s")
     args = parse_args()
 
-    cfg, policy, preprocessor, postprocessor = load_policy(args.model_path, args.device)
+    cfg, policy, preprocessor, postprocessor = load_policy(
+        args.model_path, args.device, args.num_inference_steps
+    )
     horizon = args.horizon or int(getattr(cfg, "chunk_size", 7))
 
     ds = LeRobotDataset("local/offline_eval", root=args.dataset_root, video_backend="pyav")
@@ -225,8 +232,9 @@ def main() -> None:
         second_camera_policy_key=args.second_camera_policy_key,
     )
 
+    policy_name = str(getattr(cfg, "type", "policy")).replace("_", " ").title()
     title = (
-        f"VLA-JEPA h={horizon} episode {args.episode_index} dataset replay: "
+        f"{policy_name} h={horizon} episode {args.episode_index} dataset replay: "
         "prediction vs GT action vs observation.state"
     )
     plot_curves(args.out, timestamps, pred, gt, state, boundaries, title)
@@ -241,6 +249,10 @@ def main() -> None:
         boundaries=np.asarray(boundaries),
         action_names=np.asarray(ACTION_NAMES),
     )
+    mae = np.mean(np.abs(pred - gt), axis=0)
+    rmse = np.sqrt(np.mean(np.square(pred - gt), axis=0))
+    logging.info("Per-joint MAE: %s", dict(zip(ACTION_NAMES, mae.tolist(), strict=True)))
+    logging.info("Per-joint RMSE: %s", dict(zip(ACTION_NAMES, rmse.tolist(), strict=True)))
     logging.info("Saved plot to %s", args.out)
     logging.info("Saved arrays to %s", npz_out)
 

@@ -536,6 +536,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._sync_policy_device()
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
+        policy_output_tensor = action_tensor.detach().float().cpu()
         self._sync_policy_device()
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
@@ -564,6 +565,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         action_tensor = action_tensor.detach().cpu()
         self._sync_policy_device()
+
+        self._record_timeline(
+            "policy_action_chunk",
+            source_observation_timestep=observation_t.get_timestep(),
+            policy_output=policy_output_tensor.squeeze(0).tolist(),
+            postprocessed_action=action_tensor.tolist(),
+        )
 
         """5. Convert to TimedAction list"""
         postprocess_stops = time.perf_counter()

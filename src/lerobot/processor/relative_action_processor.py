@@ -101,9 +101,16 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    mask: list[bool] | None = None
+    state_index: int = -1
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
+        if self.mask is not None:
+            explicit = [bool(value) for value in self.mask[:action_dim]]
+            if len(explicit) < action_dim:
+                explicit.extend([False] * (action_dim - len(explicit)))
+            return explicit
         if not self.exclude_joints or self.action_names is None:
             return [True] * action_dim
 
@@ -125,6 +132,11 @@ class RelativeActionsProcessorStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
+
+        # Dataset batches may contain a temporal state window.  Cache and use
+        # the same reference state selected when this checkpoint was trained.
+        if state is not None and state.ndim > 2:
+            state = state[:, self.state_index, :]
 
         # Always cache state for the paired AbsoluteActionsProcessorStep
         if state is not None:
@@ -151,6 +163,8 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "mask": self.mask,
+            "state_index": self.state_index,
         }
 
     def transform_features(

@@ -1,0 +1,208 @@
+你在训练服务器上负责修复并重新训练 LeRobot 的 VLA-JEPA three-cubes policy。
+
+代码仓库预计位于：
+/home/rxhuang/Projects/lerobot
+
+训练数据预计位于：
+/data/rxhuang/three_cubes_1
+
+请先自行检查实际路径、conda 环境、GPU数量、已有训练脚本和 checkpoint，不要假设路径一定正确。不要覆盖现有模型，所有新模型输出到独立目录，例如：
+
+/home/rxhuang/Projects/models/three_cubes_1/vla_jepa_delta_v2
+
+背景和已确认的问题：
+
+1. 数据集是 SO-101、30 Hz、6维绝对关节位置：
+   shoulder_pan, shoulder_lift, elbow_flex,
+   wrist_flex, wrist_roll, gripper。
+
+2. 当前 checkpoint 使用：
+   - STATE: MEAN_STD
+   - ACTION: MIN_MAX
+   - 绝对 action
+   - chunk_size=7
+   - num_inference_timesteps=4
+
+3. 当前模型不是简单的推理归一化错误。反归一化公式和关节顺序已经确认正确，输出也没有触及 [-1,1] clip 边界。
+
+4. 当前 checkpoint 在训练数据首帧上就有明显系统误差。最典型的是 episode 17：
+
+   state0:
+   [0.22, -104.66, 88.84, 75.38, 3.38, 1.36]
+
+   前7步 GT 大约为：
+   [4.40, -104.66, 88.26, 74.55, 3.82, 8.8]
+
+   当前模型预测范围：
+   shoulder_pan: -2.34 .. -0.92
+   shoulder_lift: -97.28 .. -91.24
+   elbow_flex: 72.12 .. 78.39
+   wrist_flex: 73.64 .. 76.16
+   wrist_roll: 6.08 .. 6.72
+   gripper: 3.39 .. 4.85
+
+   第一chunk MAE：
+   [6.03, 9.58, 12.30, 0.66, 2.63, 4.77] degrees
+
+   因此真机第一步就走错方向。
+
+5. Jetson Thor 上单次推理约0.26–0.28秒。7步 action 在30 Hz下只覆盖0.233秒，因此 chunk_size=7无法连续执行。新模型至少应训练16步 action chunk，必要时比较16和24。
+
+你的任务：
+
+一、审计现有实现
+
+- 检查：
+  src/lerobot/policies/vla_jepa/
+  训练入口、processor、checkpoint保存和PEFT加载流程。
+- 确认训练和推理使用完全相同的：
+  - action表示
+  - normalization stats
+  - state/action维度
+  - camera key映射
+  - action顺序
+- 检查基础模型7维action/8维state加载到6维模型时的 shape mismatch。
+- 当前会出现4个随机初始化警告。确认LoRA的 modules_to_save 是否确实覆盖这些层。
+- 修改加载流程或配置，使日志能够明确证明活动action head加载的是微调后的6维权重，而不是随机权重。
+- 添加自动测试验证保存后重新加载的模型输出与保存前一致。
+
+二、实现更适合真机的 action 表示
+
+优先实现并训练 residual/delta action：
+
+- 前5个关节：
+  delta_action = target_action - current_state
+- gripper：
+  保持绝对action，除非数据分析证明delta更好。
+- 建议 mask：
+  [true, true, true, true, true, false]
+
+关键要求：
+
+- 必须使用实际 delta_action 数据重新计算 normalization stats。
+- 禁止先转delta，再使用absolute action stats。
+- normalization、denormalization和add-state-back必须放入可保存、可重新加载的processor或明确的policy逻辑中。
+- 训练、离线评估、异步推理必须走同一条processor路径。
+- 不允许仅修改推理端而继续使用旧checkpoint。
+- 比较以下方案：
+  A. 当前 absolute action + MIN_MAX baseline
+  B. delta action + MEAN_STD
+  C. delta action + robust quantile normalization
+- 先用小规模训练确定方案，再进行完整训练。
+
+三、修改时序配置
+
+- 数据集和部署控制频率都按30 Hz处理。
+- 比较 chunk_size=16 和 chunk_size=24。
+- 不要把30 Hz轨迹按10 Hz执行。
+- 确认 observation 只使用当前和合法历史帧，不得使用未来图像。
+- 保留完整chunk输出。
+- 记录模型单次推理时间和chunk覆盖时间。
+
+四、数据划分与评估
+
+必须按episode划分，避免同episode帧泄漏：
+
+- train: 80 episodes
+- validation: 10 episodes
+- test: 10 episodes
+- 固定并记录episode编号和随机种子。
+
+评估不能只画整条曲线。必须输出：
+
+1. 每关节物理角度MAE/RMSE。
+2. 每个chunk内第1、4、8、16步误差。
+3. 每个任务阶段误差：
+   - 初始接近红块
+   - 抓取
+   - 移动到箱子
+   - 放置
+4. normalized output范围和饱和比例。
+5. action相对state的范围。
+6. chunk边界跳变。
+7. episode 17首帧的固定回归测试。
+8. 保存前后模型输出一致性测试。
+9. 至少生成：
+   - prediction vs GT vs state曲线
+   - first-chunk误差图
+   - action范围/归一化分布图
+   - 训练和验证loss曲线
+
+五、checkpoint选择标准
+
+不要只按training loss选择模型。优先按照validation physical-action error选择。
+
+最低验收要求：
+
+- episode 17首chunk：
+  - shoulder_lift MAE < 3°
+  - elbow_flex MAE < 3°
+  - 其他关节MAE尽量 < 3°
+- held-out test episodes主要关节平均MAE < 3°。
+- normalized action基本不饱和，|x|>=0.999比例应很低。
+- chunk边界不得出现明显非任务所需的大跳变。
+- 重新加载checkpoint后输出必须与保存前一致。
+- action chunk至少16步。
+- 推理输出必须是6维，顺序严格匹配SO-101。
+
+如果上述指标无法达到，不要宣称训练成功。继续分析：
+
+- action head是否欠拟合
+- conditioning token是否正确
+- state是否正确进入active PEFT action head
+- LoRA target_modules/modules_to_save是否合理
+- world-model loss是否干扰action训练
+- freeze_qwen=true/false的影响
+- action loss权重
+- 学习率、训练步数和batch size
+- absolute与delta action对比
+
+六、训练策略
+
+建议分阶段：
+
+1. 完成数据和processor审计。
+2. 建立当前checkpoint的可重复baseline。
+3. 实现delta action及单元测试。
+4. 运行500–1000 step smoke training，确认：
+   - loss下降
+   - processor round-trip正确
+   - checkpoint可重新加载
+   - episode 17误差开始下降
+5. 再运行完整训练。
+6. 每隔固定steps保存checkpoint并执行validation。
+7. 最终只保留指标最好的若干checkpoint，不要只取last。
+
+训练时充分使用服务器GPU，合理设置：
+
+- bf16
+- gradient accumulation
+- dataloader workers
+- distributed training/accelerate（如果多GPU）
+- 显存监控
+- 固定seed
+
+不要为了吞吐量改变30 Hz的动作语义。
+
+七、交付内容
+
+完成后提供：
+
+1. 修改过的文件和理由。
+2. 完整训练命令。
+3. 最终checkpoint绝对路径。
+4. train/validation/test episode划分。
+5. 所有评估指标和图表路径。
+6. episode 17新旧模型对比。
+7. action normalization公式和统计量。
+8. checkpoint加载验证结果。
+9. Jetson Thor部署建议：
+   - actions_per_chunk
+   - client FPS
+   - aggregation方式
+   - 安全限制
+10. 一份Markdown报告。
+
+不要修改或删除旧checkpoint。
+不要上传模型或数据到Hub。
+不要只给建议：实际检查代码、实现、运行测试和训练，并根据验证指标迭代。

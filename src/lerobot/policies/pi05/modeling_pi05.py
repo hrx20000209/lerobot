@@ -403,6 +403,20 @@ class PaliGemmaWithExpertModel(
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
+    @staticmethod
+    def _active_modules_to_save(module: nn.Module) -> nn.Module:
+        modules_to_save = getattr(module, "modules_to_save", None)
+        active_adapter = getattr(module, "active_adapter", None)
+        if modules_to_save is not None and active_adapter in modules_to_save:
+            return modules_to_save[active_adapter]
+        return module
+
+    def _paligemma(self) -> nn.Module:
+        return self._active_modules_to_save(self.paligemma)
+
+    def _gemma_expert(self) -> nn.Module:
+        return self._active_modules_to_save(self.gemma_expert)
+
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
@@ -427,35 +441,37 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def _set_requires_grad(self):
+        paligemma = self._paligemma()
         if self.freeze_vision_encoder:
-            self.paligemma.model.vision_tower.eval()
-            for param in self.paligemma.model.vision_tower.parameters():
+            paligemma.model.vision_tower.eval()
+            for param in paligemma.model.vision_tower.parameters():
                 param.requires_grad = False
         if self.train_expert_only:
-            self.paligemma.eval()
-            for param in self.paligemma.parameters():
+            paligemma.eval()
+            for param in paligemma.parameters():
                 param.requires_grad = False
 
     def train(self, mode: bool = True):
         super().train(mode)
+        paligemma = self._paligemma()
         if self.freeze_vision_encoder:
-            self.paligemma.model.vision_tower.eval()
+            paligemma.model.vision_tower.eval()
         if self.train_expert_only:
-            self.paligemma.eval()
+            paligemma.eval()
 
     def embed_image(self, image: torch.Tensor):
         # Vision tower and multi_modal_projector are kept in float32 (params_to_keep_float32).
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
-        image_outputs = self.paligemma.model.get_image_features(image)
+        image_outputs = self._paligemma().model.get_image_features(image)
         features = image_outputs.pooler_output
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.model.language_model.get_input_embeddings()(tokens)
+        return self._paligemma().model.language_model.get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -468,8 +484,10 @@ class PaliGemmaWithExpertModel(
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+        paligemma = self._paligemma()
+        gemma_expert = self._gemma_expert()
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.model.language_model.forward(
+            prefix_output = paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -481,7 +499,7 @@ class PaliGemmaWithExpertModel(
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
+            suffix_output = gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -493,14 +511,14 @@ class PaliGemmaWithExpertModel(
             prefix_output = None
             prefix_past_key_values = None
         else:
-            paligemma_layers = self.paligemma.model.language_model.layers
-            gemma_expert_layers = self.gemma_expert.model.layers
-            rotary_emb = self.paligemma.model.language_model.rotary_emb
+            paligemma_layers = paligemma.model.language_model.layers
+            gemma_expert_layers = gemma_expert.model.layers
+            rotary_emb = paligemma.model.language_model.rotary_emb
 
             # Check if gradient checkpointing is enabled for any of the models
             use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
+                hasattr(gemma_expert.model, "gradient_checkpointing")
+                and gemma_expert.model.gradient_checkpointing
                 and self.training
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
@@ -530,8 +548,8 @@ class PaliGemmaWithExpertModel(
 
             # final norm
             final_norms = (
-                self.paligemma.model.language_model.norm,
-                self.gemma_expert.model.norm,
+                paligemma.model.language_model.norm,
+                gemma_expert.model.norm,
             )
 
             def compute_final_norms(inputs_embeds, adarms_cond):
@@ -602,20 +620,51 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
+    @staticmethod
+    def _active_modules_to_save(module: nn.Module) -> nn.Module:
+        """Return PEFT's active saved module when a full submodule is wrapped."""
+        modules_to_save = getattr(module, "modules_to_save", None)
+        active_adapter = getattr(module, "active_adapter", None)
+        if modules_to_save is not None and active_adapter in modules_to_save:
+            return modules_to_save[active_adapter]
+        return module
+
+    def _action_projection_dim(self) -> int:
+        action_in_proj = self._active_modules_to_save(self.action_in_proj)
+        out_features = getattr(action_in_proj, "out_features", None)
+        if out_features is None:
+            raise AttributeError(
+                f"{type(self.action_in_proj).__name__} does not expose out_features and could not be unwrapped"
+            )
+        return int(out_features)
+
+    def _paligemma_expert(self) -> nn.Module:
+        return self._active_modules_to_save(self.paligemma_with_expert)
+
+    def _paligemma(self) -> nn.Module:
+        return self._active_modules_to_save(self._paligemma_expert().paligemma)
+
+    def _gemma_expert(self) -> nn.Module:
+        return self._active_modules_to_save(self._paligemma_expert().gemma_expert)
+
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        paligemma = self._paligemma()
+        gemma_expert = self._gemma_expert()
+        paligemma.model.language_model.gradient_checkpointing = True
+        paligemma.model.vision_tower.gradient_checkpointing = True
+        gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        paligemma = self._paligemma()
+        gemma_expert = self._gemma_expert()
+        paligemma.model.language_model.gradient_checkpointing = False
+        paligemma.model.vision_tower.gradient_checkpointing = False
+        gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05Pytorch model")
 
     def _rtc_enabled(self):
@@ -657,12 +706,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         embs = []
         pad_masks = []
         att_masks = []
+        paligemma_with_expert = self._paligemma_expert()
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
 
             def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                return paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
@@ -673,7 +723,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Process language tokens
         def lang_embed_func(tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
+            lang_emb = paligemma_with_expert.embed_language_tokens(tokens)
             return lang_emb
 
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
@@ -701,7 +751,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
-            self.action_in_proj.out_features,
+            self._action_projection_dim(),
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=timestep.device,
@@ -748,10 +798,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
-        if (
-            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+        paligemma_with_expert = self._paligemma_expert()
+        paligemma = self._active_modules_to_save(paligemma_with_expert.paligemma)
+        if paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -764,7 +813,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (_, suffix_out), _ = paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -820,9 +869,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        paligemma_with_expert = self._paligemma_expert()
+        self._active_modules_to_save(paligemma_with_expert.paligemma).model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        _, past_key_values = paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -890,10 +940,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        paligemma_with_expert = self._paligemma_expert()
+        self._active_modules_to_save(paligemma_with_expert.gemma_expert).model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = clone_past_key_values(past_key_values)
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _ = paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,

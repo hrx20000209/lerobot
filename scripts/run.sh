@@ -17,7 +17,7 @@ lerobot-record \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM1 \
   --robot.id=follower_arm \
-  --robot.cameras='{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+  --robot.cameras='{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
   --dataset.repo_id=hrx2000/eval_pi0 \
   --dataset.single_task="go to red cube. take the red cube. go to box. put the red cube in box." \
   --policy.path=/home/hrx/Projects/models/three_cubes_1/vla_jepa_lora/ \

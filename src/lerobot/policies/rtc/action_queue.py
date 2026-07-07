@@ -240,6 +240,11 @@ class ActionQueue:
                     indexes_diff,
                     real_delay,
                 )
-                return real_delay
+                # The policy trajectory advances when an action is consumed,
+                # not merely because wall-clock time elapsed. If inference
+                # outlives the current queue the robot is stationary, so using
+                # wall-clock delay would incorrectly skip unexecuted actions
+                # and introduce a large command jump at the next chunk.
+                return indexes_diff
 
         return effective_delay

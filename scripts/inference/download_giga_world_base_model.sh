@@ -9,7 +9,7 @@ MAX_WORKERS="${MAX_WORKERS:-4}"
 export REPO_ID
 export CACHE_DIR
 export MAX_WORKERS
-export HF_HOME="${HF_HOME:-/data/hf_cache}"
+export HF_HOME="${HF_HOME:-/home/hrx/.cache/huggingface}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-0}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"

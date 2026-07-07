@@ -208,6 +208,14 @@ def build_rollout_context(
     policy.eval()
     logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
 
+    # GigaWorld lazily loads the WAN transformer, VAE, T5 encoder, and pipeline.
+    # Finish that work before connecting hardware or starting an episode;
+    # otherwise short rollouts can expire without producing a single action.
+    if policy_config.type == "giga_world" and hasattr(policy, "prepare_for_inference"):
+        logger.info("Preparing GigaWorld runtime before connecting hardware...")
+        policy.prepare_for_inference(cfg.task)
+        logger.info("GigaWorld runtime ready")
+
     if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
         try:
             if hasattr(torch, "compile"):
@@ -379,14 +387,22 @@ def build_rollout_context(
             cfg.rename_map,
         )
 
+    # GigaWorld checkpoints intentionally persist Identity-only processors.
+    # The policy handles device placement itself, so generic device/rename
+    # overrides have no matching steps and must not be passed.
+    preprocessor_overrides = (
+        {}
+        if policy_config.type == "giga_world"
+        else {
+            "device_processor": {"device": cfg.device},
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        }
+    )
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_config,
         pretrained_path=cfg.policy.pretrained_path,
         dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
+        preprocessor_overrides=preprocessor_overrides,
     )
 
     if isinstance(cfg.inference, SyncInferenceConfig) and any(
