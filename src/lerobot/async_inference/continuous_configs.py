@@ -95,6 +95,16 @@ class ContinuousRobotClientConfig(RobotClientConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        legacy_aggregate_map = {
+            "latest_only": "replace_remaining",
+            "weighted_average": "smooth_blend_remaining",
+            "average": "smooth_blend_remaining",
+            "conservative": "conservative_update",
+        }
+        if self.aggregation_fn in legacy_aggregate_map:
+            self.aggregation_fn = legacy_aggregate_map[self.aggregation_fn]
+        elif self.aggregation_fn == "replace_remaining" and self.aggregate_fn_name in legacy_aggregate_map:
+            self.aggregation_fn = legacy_aggregate_map[self.aggregate_fn_name]
         if self.async_mode != "continuous":
             raise ValueError("ContinuousRobotClientConfig only supports async_mode='continuous'")
         if self.continuous_obs_fps <= 0:

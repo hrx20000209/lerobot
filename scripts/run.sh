@@ -2,7 +2,7 @@ lerobot-record \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM1\
   --robot.id=follower_arm \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --dataset.repo_id=hrx2000/eval_pi0 \
   --dataset.single_task="go to red cube. take the red cube. go to box. put the red cube in box." \
   --policy.path=/home/hrx/Projects/models/three_cubes_1/smolvla/ \
@@ -61,10 +61,10 @@ python -m lerobot.async_inference.robot_client \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM1 \
   --robot.id=follower_arm \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --task="go to red cube. take the red cube. go to box. put the red cube in box." \
-  --policy_type=pi05 \
-  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05_lora_expert/ \
+  --policy_type=smolvla \
+  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/smolvla/ \
   --policy_device=cuda \
   --actions_per_chunk=50 \
   --chunk_size_threshold=1.0 \
@@ -78,7 +78,7 @@ python -m lerobot.async_inference.robot_client \
   --robot.type=so101_follower \
   --robot.port=/dev/ttyACM0 \
   --robot.id=follower_arm \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, right: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
   --task="Pick up the blue cube into the box." \
   --policy_type=smolvla \
   --pretrained_name_or_path=/home/hrx/Projects/models/smolvla/ \
@@ -92,16 +92,16 @@ python -m lerobot.async_inference.robot_client \
 python -m lerobot.async_inference.robot_client \
   --server_address=127.0.0.1:8080 \
   --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
+  --robot.port=/dev/ttyACM1 \
   --robot.id=follower_arm \
-  --robot.cameras="{ front: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
-  --task="Pick up the blue cube into the box." \
-  --policy_type=smolvla \
-  --pretrained_name_or_path=/home/hrx/Projects/models/smolvla/ \
+  --robot.cameras="{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30, fourcc: "MJPG"}, wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}" \
+  --task="go to red cube. take the red cube. go to box. put the red cube in box." \
+  --policy_type=pi05 \
+  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/pi05_front_wrist/ \
   --policy_device=cuda \
   --actions_per_chunk=50 \
-  --chunk_size_threshold=0.2 \
-  --aggregate_fn_name=weighted_average \
+  --chunk_size_threshold=0.8 \
+  --aggregate_fn_name=latest_only \
   --debug_visualize_queue_size=True 
 
 

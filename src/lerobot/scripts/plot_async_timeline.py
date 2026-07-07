@@ -11,17 +11,177 @@ import json
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean
-from typing import Any
+from typing import Any, Sequence
 
 
-def _load_events(log_path: str | Path) -> list[dict[str, Any]]:
+def _load_events(log_path: str | Path | Sequence[str | Path]) -> list[dict[str, Any]]:
+    if isinstance(log_path, str | Path):
+        paths = [log_path]
+    else:
+        paths = list(log_path)
     events = []
-    with Path(log_path).open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                events.append(json.loads(line))
-    return events
+    for path in paths:
+        with Path(path).open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    event = json.loads(line)
+                    event["_source_log_path"] = str(path)
+                    events.append(event)
+    return _normalize_events(events)
+
+
+def _record_ts(event: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = event.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return float(value)
+    value = event.get("monotonic_ts")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    value = event.get("time")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _normalized_event(event_type: str, source: dict[str, Any], **fields: Any) -> dict[str, Any]:
+    monotonic_ts = fields.get("monotonic_ts")
+    if not isinstance(monotonic_ts, int | float) or isinstance(monotonic_ts, bool):
+        monotonic_ts = _record_ts(source)
+    return {
+        "event_type": event_type,
+        "monotonic_ts": monotonic_ts,
+        "wall_time": source.get("wall_time", source.get("time")),
+        "_source_log_path": source.get("_source_log_path"),
+        **fields,
+    }
+
+
+def _normalize_latency_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    inference_ids: dict[tuple[Any, Any, Any], int] = {}
+
+    def inference_id_for(event: dict[str, Any]) -> int:
+        key = (event.get("timestep"), event.get("start_time"), event.get("end_time"))
+        if key not in inference_ids:
+            inference_ids[key] = len(inference_ids)
+        return inference_ids[key]
+
+    for event in events:
+        kind = event.get("kind")
+        if kind == "timeline_observation":
+            obs_id = event.get("timestep")
+            capture_end_ts = _record_ts(event, "end_time", "observation_time", "time")
+            normalized.append(
+                _normalized_event(
+                    "observation_capture_end",
+                    event,
+                    monotonic_ts=capture_end_ts,
+                    obs_id=obs_id,
+                    obs_capture_start_ts=_record_ts(event, "start_time"),
+                    obs_capture_end_ts=capture_end_ts,
+                    queue_size=event.get("queue_size"),
+                    must_go=event.get("must_go"),
+                    image_paths=event.get("image_paths"),
+                )
+            )
+        elif kind == "timeline_server_inference":
+            inference_id = inference_id_for(event)
+            source_obs_id = event.get("timestep")
+            start_ts = _record_ts(event, "start_time")
+            end_ts = _record_ts(event, "end_time")
+            normalized.append(
+                _normalized_event(
+                    "inference_started",
+                    event,
+                    monotonic_ts=start_ts,
+                    inference_id=inference_id,
+                    source_obs_id=source_obs_id,
+                    obs_id=source_obs_id,
+                    inference_start_ts=start_ts,
+                    source_obs_capture_ts=_record_ts(event, "observation_time"),
+                    first_timestep=event.get("first_timestep"),
+                    last_timestep=event.get("last_timestep"),
+                )
+            )
+            latency = end_ts - start_ts if isinstance(start_ts, float) and isinstance(end_ts, float) else None
+            normalized.append(
+                _normalized_event(
+                    "inference_finished",
+                    event,
+                    monotonic_ts=end_ts,
+                    inference_id=inference_id,
+                    source_obs_id=source_obs_id,
+                    obs_id=source_obs_id,
+                    inference_start_ts=start_ts,
+                    inference_end_ts=end_ts,
+                    action_chunk_size=event.get("actions_count"),
+                    model_latency=latency,
+                    first_timestep=event.get("first_timestep"),
+                    last_timestep=event.get("last_timestep"),
+                )
+            )
+        elif kind == "timeline_receive_actions":
+            source_obs_id = event.get("first_timestep")
+            normalized.append(
+                _normalized_event(
+                    "queue_update_finished",
+                    event,
+                    monotonic_ts=_record_ts(event, "receive_time", "time"),
+                    inference_id=source_obs_id,
+                    source_obs_id=source_obs_id,
+                    aggregation_fn="client_aggregate",
+                    old_queue_length=event.get("queue_size_before"),
+                    new_queue_length=event.get("queue_size_after"),
+                    num_actions_replaced=None,
+                    num_actions_blended=None,
+                    first_timestep=event.get("first_timestep"),
+                    last_timestep=event.get("last_timestep"),
+                    actions_count=event.get("actions_count"),
+                )
+            )
+        elif kind == "timeline_action":
+            timestep = event.get("timestep")
+            source_obs_id = event.get("source_observation_timestep")
+            if source_obs_id is None:
+                source_obs_id = event.get("timestep")
+            try:
+                chunk_index = int(timestep) - int(source_obs_id)
+            except (TypeError, ValueError):
+                chunk_index = None
+            normalized.append(
+                _normalized_event(
+                    "action_execution_finished",
+                    event,
+                    monotonic_ts=_record_ts(event, "end_time", "time"),
+                    action_id=timestep,
+                    source_obs_id=source_obs_id,
+                    source_inference_id=source_obs_id,
+                    chunk_index=chunk_index,
+                    predicted_for_step_index=timestep,
+                    actual_exec_start_ts=_record_ts(event, "start_time"),
+                    actual_exec_end_ts=_record_ts(event, "end_time"),
+                    queue_size_before=event.get("queue_size_before"),
+                    queue_size_after=event.get("queue_size_after"),
+                )
+            )
+        else:
+            normalized.append(event)
+
+    return normalized
+
+
+def _normalize_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if any("event_type" in event for event in events):
+        normalized = []
+        for event in events:
+            if "event_type" in event:
+                if "monotonic_ts" not in event:
+                    event["monotonic_ts"] = _record_ts(event)
+                normalized.append(event)
+        return normalized
+    return _normalize_latency_events(events)
 
 
 def _numbers(events: list[dict[str, Any]], key: str, event_type: str | None = None) -> list[float]:
@@ -109,7 +269,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def plot_timeline(
-    log_path: str | Path,
+    log_path: str | Path | Sequence[str | Path],
     output_path: str | Path,
     window_start: float = 0.0,
     window_duration: float = 8.0,
@@ -326,7 +486,12 @@ def plot_timeline(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log_path", required=True)
+    parser.add_argument(
+        "--log_path",
+        required=True,
+        nargs="+",
+        help="One or more JSONL logs. Supports continuous event logs and classic *_latency_*.jsonl logs.",
+    )
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--window_start", type=float, default=0.0)
     parser.add_argument("--window_duration", type=float, default=8.0)
