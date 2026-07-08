@@ -180,6 +180,10 @@ class RobotClientConfig:
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
     )
+    run_seconds: float | None = field(
+        default=None,
+        metadata={"help": "Stop the async robot client after this many seconds of control loop runtime."},
+    )
     display_data: bool = field(
         default=False,
         metadata={"help": "Stream robot observations and executed actions to Rerun"},
@@ -250,6 +254,12 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.run_seconds is not None:
+            if self.run_seconds < 0:
+                raise ValueError("run_seconds must be non-negative when set")
+            if self.run_seconds == 0:
+                self.run_seconds = None
+
         if self.system_resource_interval_s <= 0:
             raise ValueError(
                 f"system_resource_interval_s must be positive, got {self.system_resource_interval_s}"
@@ -275,6 +285,7 @@ class RobotClientConfig:
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "run_seconds": self.run_seconds,
             "display_data": self.display_data,
             "display_ip": self.display_ip,
             "display_port": self.display_port,

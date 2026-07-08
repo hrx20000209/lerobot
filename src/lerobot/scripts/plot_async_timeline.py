@@ -274,6 +274,14 @@ def plot_timeline(
     window_start: float = 0.0,
     window_duration: float = 8.0,
     summary_path: str | Path | None = None,
+    seconds_per_inch: float = 1.4,
+    min_fig_width: float = 18.0,
+    fig_height: float = 8.5,
+    dpi: int = 220,
+    obs_label_stride: int = 1,
+    inference_label_stride: int = 1,
+    action_label_stride: int = 10,
+    queue_label_stride: int = 5,
 ) -> dict[str, Any]:
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -283,7 +291,15 @@ def plot_timeline(
     if not events:
         raise ValueError(f"No events found in {log_path}")
 
-    first_ts = min(float(event["monotonic_ts"]) for event in events if "monotonic_ts" in event)
+    timestamps = [
+        float(event["monotonic_ts"])
+        for event in events
+        if isinstance(event.get("monotonic_ts"), int | float) and not isinstance(event.get("monotonic_ts"), bool)
+    ]
+    first_ts = min(timestamps)
+    last_ts = max(timestamps)
+    if window_duration <= 0:
+        window_duration = max(0.1, last_ts - first_ts - window_start)
     start_abs = first_ts + window_start
     end_abs = start_abs + window_duration
 
@@ -302,7 +318,8 @@ def plot_timeline(
     queue_updates = [e for e in events if e.get("event_type") == "queue_update_finished"]
     action_finish = [e for e in events if e.get("event_type") == "action_execution_finished"]
 
-    fig, ax = plt.subplots(figsize=(18, 7))
+    fig_width = max(min_fig_width, window_duration * seconds_per_inch)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     lanes = {
         "observation capture/send": 2.2,
         "server inference": 1.2,
@@ -312,7 +329,7 @@ def plot_timeline(
     for y in lanes.values():
         ax.hlines(y, window_start, window_start + window_duration, color="#555555", linewidth=1.5)
 
-    for event in obs_events:
+    for obs_idx, event in enumerate(obs_events):
         ts = rel(event.get("obs_capture_end_ts") or event.get("monotonic_ts"))
         if ts is None or not (window_start <= ts <= window_start + window_duration):
             continue
@@ -326,7 +343,12 @@ def plot_timeline(
             color=color,
             linewidth=linewidth,
         )
-        if obs_id in used_obs:
+        should_label_obs = (
+            obs_id in used_obs
+            and obs_label_stride > 0
+            and obs_idx % obs_label_stride == 0
+        )
+        if should_label_obs:
             ax.text(
                 ts,
                 lanes["observation capture/send"] + 0.18,
@@ -340,7 +362,7 @@ def plot_timeline(
     for event in action_finish:
         by_source[(event.get("source_inference_id"), event.get("source_obs_id"))].append(event)
 
-    for event in inf_finish:
+    for inf_idx, event in enumerate(inf_finish):
         inference_id = event.get("inference_id")
         start_event = inf_start_by_id.get(inference_id, {})
         start = rel(start_event.get("inference_start_ts") or event.get("inference_start_ts"))
@@ -362,16 +384,18 @@ def plot_timeline(
         latency = event.get("model_latency")
         obs_id = event.get("source_obs_id")
         latency_txt = f"{float(latency):.2f}s" if isinstance(latency, int | float) else ""
-        ax.text(
-            start + (end - start) / 2,
-            y + 0.16,
-            f"inf {inference_id}\nobs {obs_id}\n{latency_txt}",
-            ha="center",
-            fontsize=8,
-            color="#2f5c89",
-        )
+        if inference_label_stride > 0 and inf_idx % inference_label_stride == 0:
+            ax.text(
+                start + (end - start) / 2,
+                y + 0.16,
+                f"inf {inference_id}\nobs {obs_id}\n{latency_txt}",
+                ha="center",
+                fontsize=8,
+                color="#2f5c89",
+            )
 
     action_groups = defaultdict(list)
+    action_items: list[tuple[float, float, dict[str, Any]]] = []
     for event in action_finish:
         start = rel(event.get("actual_exec_start_ts"))
         end = rel(event.get("actual_exec_end_ts"))
@@ -379,6 +403,34 @@ def plot_timeline(
             continue
         key = (event.get("source_inference_id"), event.get("source_obs_id"))
         action_groups[key].append((start, end, event))
+        action_items.append((start, end, event))
+
+    action_items = sorted(action_items)
+    for action_idx, (start, end, event) in enumerate(action_items):
+        if end < window_start or start > window_start + window_duration:
+            continue
+        y = lanes["client action execution"]
+        ax.vlines(
+            start,
+            y - 0.18,
+            y + 0.18,
+            color="#2f7532",
+            linewidth=0.55,
+            alpha=0.65,
+        )
+        if action_label_stride > 0 and action_idx % action_label_stride == 0:
+            action_label = event.get("control_step_index", event.get("action_id", "?"))
+            ax.text(
+                start,
+                y - 0.34,
+                f"a{action_label}\ninf {event.get('source_inference_id')}\nobs {event.get('source_obs_id')}",
+                ha="right",
+                va="top",
+                rotation=70,
+                fontsize=6.5,
+                color="#2f7532",
+            )
+
     for (inf_id, obs_id), items in action_groups.items():
         items = sorted(items)
         if not items:
@@ -400,14 +452,14 @@ def plot_timeline(
         last_idx = items[-1][2].get("chunk_index")
         ax.text(
             start + (end - start) / 2,
-            y - 0.24,
-            f"inf {inf_id}\nobs {obs_id}\na{first_idx}-{last_idx}",
+            y + 0.22,
+            f"inf {inf_id}\nobs {obs_id}\nchunk {first_idx}-{last_idx}",
             ha="center",
             fontsize=8,
             color="#2f7532",
         )
 
-    for event in queue_updates:
+    for queue_idx, event in enumerate(queue_updates):
         ts = rel(event.get("monotonic_ts"))
         if ts is None or not (window_start <= ts <= window_start + window_duration):
             continue
@@ -420,17 +472,18 @@ def plot_timeline(
             linewidth=1.2,
             linestyle=":",
         )
-        label = event.get("aggregation_fn", "update")
-        if event.get("num_actions_blended"):
-            label = f"{label}\nblend {event.get('num_actions_blended')}"
-        ax.text(
-            ts + 0.015,
-            lanes["client action execution"] + 0.32,
-            label,
-            fontsize=7,
-            color=color,
-            rotation=0,
-        )
+        if queue_label_stride > 0 and queue_idx % queue_label_stride == 0:
+            label = event.get("aggregation_fn", "update")
+            if event.get("num_actions_blended"):
+                label = f"{label}\nblend {event.get('num_actions_blended')}"
+            ax.text(
+                ts + 0.015,
+                lanes["client action execution"] + 0.42,
+                label,
+                fontsize=7,
+                color=color,
+                rotation=0,
+            )
 
     duration = max(1e-6, window_duration)
     obs_in_window = [
@@ -471,7 +524,7 @@ def plot_timeline(
     fig.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180)
+    fig.savefig(output_path, dpi=dpi)
     pdf_path = output_path.with_suffix(".pdf")
     fig.savefig(pdf_path)
     plt.close(fig)
@@ -494,8 +547,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--window_start", type=float, default=0.0)
-    parser.add_argument("--window_duration", type=float, default=8.0)
+    parser.add_argument(
+        "--window_duration",
+        type=float,
+        default=8.0,
+        help="Window length in seconds. Use 0 or a negative value to plot through the end of the log.",
+    )
     parser.add_argument("--summary_path", default=None)
+    parser.add_argument(
+        "--seconds_per_inch",
+        type=float,
+        default=1.4,
+        help="Horizontal scale. Larger values make longer, more readable timelines.",
+    )
+    parser.add_argument("--min_fig_width", type=float, default=18.0)
+    parser.add_argument("--fig_height", type=float, default=8.5)
+    parser.add_argument("--dpi", type=int, default=220)
+    parser.add_argument(
+        "--obs_label_stride",
+        type=int,
+        default=1,
+        help="Label every Nth used observation. Use 0 to disable observation labels.",
+    )
+    parser.add_argument(
+        "--inference_label_stride",
+        type=int,
+        default=1,
+        help="Label every Nth inference. Use 0 to disable inference labels.",
+    )
+    parser.add_argument(
+        "--action_label_stride",
+        type=int,
+        default=10,
+        help="Label every Nth action tick. Use 1 for every action, 0 to disable action tick labels.",
+    )
+    parser.add_argument(
+        "--queue_label_stride",
+        type=int,
+        default=5,
+        help="Label every Nth queue update. Use 0 to disable queue update labels.",
+    )
     return parser
 
 
@@ -507,6 +598,14 @@ def main() -> None:
         window_start=args.window_start,
         window_duration=args.window_duration,
         summary_path=args.summary_path,
+        seconds_per_inch=args.seconds_per_inch,
+        min_fig_width=args.min_fig_width,
+        fig_height=args.fig_height,
+        dpi=args.dpi,
+        obs_label_stride=args.obs_label_stride,
+        inference_label_stride=args.inference_label_stride,
+        action_label_stride=args.action_label_stride,
+        queue_label_stride=args.queue_label_stride,
     )
     print(json.dumps(summary, indent=2))
 

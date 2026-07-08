@@ -689,12 +689,21 @@ class RobotClient:
         # Wait at barrier for synchronized start
         self.start_barrier.wait()
         self.logger.info("Control loop thread starting")
+        run_start_time = time.perf_counter()
 
         _performed_action = None
         _captured_observation = None
 
         while self.running:
             control_loop_start = time.perf_counter()
+            if self.config.run_seconds is not None and control_loop_start - run_start_time >= self.config.run_seconds:
+                self._record_timeline(
+                    "timeline_run_seconds_reached",
+                    run_seconds=self.config.run_seconds,
+                    elapsed_seconds=control_loop_start - run_start_time,
+                )
+                self.shutdown_event.set()
+                break
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)

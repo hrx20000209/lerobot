@@ -79,6 +79,7 @@ class ContinuousRobotClient(RobotClient):
         self._obs_local_capture_ts: OrderedDict[int, float] = OrderedDict()
         self._obs_local_capture_ts_lock = threading.RLock()
         self._obs_local_capture_ts_capacity = 256
+        self._robot_io_lock = threading.RLock()
         self._last_commanded_action: torch.Tensor | None = None
         self._last_sanitized_action: torch.Tensor | None = None
         self._executed_control_steps = 0
@@ -98,7 +99,8 @@ class ContinuousRobotClient(RobotClient):
             return value
 
     def _capture_continuous_observation(self, obs_id: int) -> TimedObservation:
-        raw_observation: RawObservation = self.robot.get_observation()
+        with self._robot_io_lock:
+            raw_observation: RawObservation = self.robot.get_observation()
         if self._last_commanded_action is None:
             try:
                 self._last_commanded_action = torch.tensor(
@@ -109,12 +111,13 @@ class ContinuousRobotClient(RobotClient):
         raw_observation["task"] = self.config.task
         if self.config.display_data:
             log_rerun_data(observation=raw_observation, compress_images=True)
+        key_frame_interval = max(1, int(round(self.config.continuous_obs_fps)))
         image_paths = save_observation_images(
             raw_observation,
             self.timeline_image_dir,
             obs_id,
             mode=self.timeline_image_mode if self.config.record_timeline else "",
-            key_frame=True,
+            key_frame=obs_id % key_frame_interval == 0,
         )
         local_capture_ts = monotonic_now()
         self._remember_local_observation_time(obs_id, local_capture_ts)
@@ -224,7 +227,8 @@ class ContinuousRobotClient(RobotClient):
                     if self.config.shadow_mode or not self.config.enable_robot_execution:
                         performed_action = {"shadow_mode": True, "commanded_action": commanded_action}
                     else:
-                        performed_action = self.robot.send_action(commanded_action)
+                        with self._robot_io_lock:
+                            performed_action = self.robot.send_action(commanded_action)
                     self._last_commanded_action = (
                         self._last_sanitized_action.detach().float().cpu()
                         if self._last_sanitized_action is not None
@@ -262,7 +266,16 @@ class ContinuousRobotClient(RobotClient):
         self._action_executor_thread = threading.Thread(target=self.execute_actions_continuous, daemon=True)
         self._action_receiver_thread.start()
         self._action_executor_thread.start()
+        run_start_ts = monotonic_now()
         while self.running:
+            if self.config.run_seconds is not None and monotonic_now() - run_start_ts >= self.config.run_seconds:
+                self.event_logger.record(
+                    "run_seconds_reached",
+                    run_seconds=self.config.run_seconds,
+                    elapsed_seconds=monotonic_now() - run_start_ts,
+                )
+                self.shutdown_event.set()
+                break
             time.sleep(0.2)
 
     def stop(self):

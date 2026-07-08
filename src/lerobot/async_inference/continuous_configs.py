@@ -90,6 +90,10 @@ class ContinuousRobotClientConfig(RobotClientConfig):
     max_control_steps: int | None = field(
         default=None, metadata={"help": "Stop the continuous client after this many executed control steps."}
     )
+    run_seconds: float | None = field(
+        default=None,
+        metadata={"help": "Stop the continuous client after this many seconds of continuous control."},
+    )
     emergency_stop: bool = field(
         default=False, metadata={"help": "Reject queue updates and action execution."}
     )
@@ -130,3 +134,8 @@ class ContinuousRobotClientConfig(RobotClientConfig):
             raise ValueError("min_usable_actions must be non-negative")
         if self.max_control_steps is not None and self.max_control_steps <= 0:
             raise ValueError("max_control_steps must be positive when set")
+        if self.run_seconds is not None:
+            if self.run_seconds < 0:
+                raise ValueError("run_seconds must be non-negative when set")
+            if self.run_seconds == 0:
+                self.run_seconds = None

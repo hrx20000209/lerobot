@@ -27,29 +27,28 @@ CLIENT_DEVICE="${CLIENT_DEVICE:-cpu}"
 TASK="${TASK:-go to red cube. take the red cube. go to box. put the red cube in box.}"
 
 ACTIONS_PER_CHUNK="${ACTIONS_PER_CHUNK:-50}"
-CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-1.0}"
+CHUNK_SIZE_THRESHOLD="${CHUNK_SIZE_THRESHOLD:-0.5}"
 AGGREGATE_FN_NAME="${AGGREGATE_FN_NAME:-conservative}"
-CONTINUOUS_AGGREGATION_FN="${CONTINUOUS_AGGREGATION_FN:-latency_aligned_blend}"
 FPS="${FPS:-30}"
-CONTINUOUS_OBS_FPS="${CONTINUOUS_OBS_FPS:-30}"
-OBS_QUEUE_TIMEOUT="${OBS_QUEUE_TIMEOUT:-0.05}"
-INFERENCE_LATENCY="${INFERENCE_LATENCY:-0}"
+INFERENCE_LATENCY="${INFERENCE_LATENCY:-0.033}"
+OBS_QUEUE_TIMEOUT="${OBS_QUEUE_TIMEOUT:-2}"
 
-# Safety default: do not move motors. To execute, run:
-#   SHADOW_MODE=False ENABLE_ROBOT_EXECUTION=True RUN_SECONDS=5 ./scripts/inference/run_so101_smolvla_continuous_async.sh
-SHADOW_MODE="${SHADOW_MODE:-True}"
+# The classic async client has no shadow mode: if it runs, it sends actions to
+# the robot. Keep an explicit guard so this script is not accidentally dangerous.
 ENABLE_ROBOT_EXECUTION="${ENABLE_ROBOT_EXECUTION:-False}"
 RUN_SECONDS="${RUN_SECONDS:-8}"
 CLIENT_TIMEOUT_GRACE="${CLIENT_TIMEOUT_GRACE:-180}"
+DISPLAY_DATA="${DISPLAY_DATA:-False}"
+TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-key}"
 
-MAX_JOINT_DELTA="${MAX_JOINT_DELTA:-15}"
-MAX_GRIPPER_DELTA="${MAX_GRIPPER_DELTA:-15}"
-MAX_JOINT_DELTA_PER_STEP="${MAX_JOINT_DELTA_PER_STEP:-8}"
-MAX_GRIPPER_DELTA_PER_STEP="${MAX_GRIPPER_DELTA_PER_STEP:-12}"
-STALE_INFERENCE_MAX_AGE="${STALE_INFERENCE_MAX_AGE:-2.0}"
-MIN_USABLE_ACTIONS="${MIN_USABLE_ACTIONS:-5}"
-TIMELINE_SAVE_IMAGES="${TIMELINE_SAVE_IMAGES:-}"
-MAX_CONTROL_STEPS="${MAX_CONTROL_STEPS:-}"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+LOG_ROOT="${LOG_ROOT:-/tmp/so101_smolvla_classic_async}"
+RUN_DIR="${RUN_DIR:-${LOG_ROOT}/${RUN_ID}}"
+TIMELINE_LOG_DIR="${RUN_DIR}/timeline_logs"
+SERVER_STDOUT_LOG="${RUN_DIR}/server_stdout.log"
+CLIENT_STDOUT_LOG="${RUN_DIR}/client_stdout.log"
+TIMELINE_PNG="${RUN_DIR}/timeline.png"
+
 PLOT_SECONDS_PER_INCH="${PLOT_SECONDS_PER_INCH:-1.4}"
 PLOT_MIN_FIG_WIDTH="${PLOT_MIN_FIG_WIDTH:-24}"
 PLOT_FIG_HEIGHT="${PLOT_FIG_HEIGHT:-9}"
@@ -59,17 +58,9 @@ PLOT_INFERENCE_LABEL_STRIDE="${PLOT_INFERENCE_LABEL_STRIDE:-1}"
 PLOT_ACTION_LABEL_STRIDE="${PLOT_ACTION_LABEL_STRIDE:-5}"
 PLOT_QUEUE_LABEL_STRIDE="${PLOT_QUEUE_LABEL_STRIDE:-3}"
 
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
-LOG_ROOT="${LOG_ROOT:-/tmp/so101_smolvla_continuous_async}"
-RUN_DIR="${RUN_DIR:-${LOG_ROOT}/${RUN_ID}}"
-SERVER_STDOUT_LOG="${RUN_DIR}/server_stdout.log"
-CLIENT_STDOUT_LOG="${RUN_DIR}/client_stdout.log"
-TIMELINE_JSONL="${RUN_DIR}/timeline.jsonl"
-TIMELINE_PNG="${RUN_DIR}/timeline.png"
-
 export PYTHONPATH="${LEROBOT_DIR}:${PYTHONPATH:-}"
 
-mkdir -p "${RUN_DIR}"
+mkdir -p "${RUN_DIR}" "${TIMELINE_LOG_DIR}"
 cd "${REPO_DIR}"
 
 require_path() {
@@ -87,6 +78,12 @@ require_path "/dev/video${RIGHT_CAMERA}"
 require_path "/dev/video${WRIST_CAMERA}"
 require_path "${PRETRAINED_NAME_OR_PATH}"
 
+if [[ ! "${ENABLE_ROBOT_EXECUTION}" =~ ^([Tt]rue|1|yes|YES)$ ]]; then
+  echo "Classic async has no shadow mode and will command motors." >&2
+  echo "Set ENABLE_ROBOT_EXECUTION=True to run it." >&2
+  exit 2
+fi
+
 if "${PYTHON_BIN}" - <<PY
 import socket
 s = socket.socket()
@@ -101,30 +98,29 @@ fi
 SERVER_PID=""
 cleanup() {
   if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "Stopping continuous async server pid=${SERVER_PID}"
+    echo "Stopping classic async server pid=${SERVER_PID}"
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-echo "Starting continuous async policy server: ${SERVER_ADDRESS}"
-"${PYTHON_BIN}" -u -m lerobot.async_inference.continuous_policy_server \
+echo "Starting classic async policy server: ${SERVER_ADDRESS}"
+"${PYTHON_BIN}" -u -m lerobot.async_inference.policy_server \
   --host="${HOST}" \
   --port="${PORT}" \
   --fps="${FPS}" \
   --inference_latency="${INFERENCE_LATENCY}" \
   --obs_queue_timeout="${OBS_QUEUE_TIMEOUT}" \
   --record_timeline=True \
-  --timeline_log_dir="${RUN_DIR}" \
-  --timeline_log_path="${TIMELINE_JSONL}" \
+  --timeline_log_dir="${TIMELINE_LOG_DIR}" \
   >"${SERVER_STDOUT_LOG}" 2>&1 &
 SERVER_PID="$!"
 
 echo "Waiting for server..."
 for _ in $(seq 1 120); do
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "Continuous async server exited during startup. Last log lines:" >&2
+    echo "Classic async server exited during startup. Last log lines:" >&2
     tail -80 "${SERVER_STDOUT_LOG}" >&2 || true
     exit 1
   fi
@@ -143,7 +139,7 @@ done
 ROBOT_CAMERAS="{ front: {type: opencv, index_or_path: ${FRONT_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"}, right: {type: opencv, index_or_path: ${RIGHT_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"}, wrist: {type: opencv, index_or_path: ${WRIST_CAMERA}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${CAMERA_FOURCC}\"} }"
 
 CLIENT_CMD=(
-  "${PYTHON_BIN}" -u -m lerobot.async_inference.continuous_robot_client
+  "${PYTHON_BIN}" -u -m lerobot.async_inference.robot_client
   --server_address="${SERVER_ADDRESS}"
   --robot.type=so101_follower
   --robot.port="${ROBOT_PORT}"
@@ -157,71 +153,50 @@ CLIENT_CMD=(
   --actions_per_chunk="${ACTIONS_PER_CHUNK}"
   --chunk_size_threshold="${CHUNK_SIZE_THRESHOLD}"
   --aggregate_fn_name="${AGGREGATE_FN_NAME}"
-  --aggregation_fn="${CONTINUOUS_AGGREGATION_FN}"
   --fps="${FPS}"
-  --continuous_obs_fps="${CONTINUOUS_OBS_FPS}"
   --run_seconds="${RUN_SECONDS}"
   --record_timeline=True
-  --timeline_log_dir="${RUN_DIR}"
-  --timeline_log_path="${TIMELINE_JSONL}"
-  --timeline_plot_path="${TIMELINE_PNG}"
+  --timeline_log_dir="${TIMELINE_LOG_DIR}"
   --timeline_save_images="${TIMELINE_SAVE_IMAGES}"
-  --stale_inference_max_age="${STALE_INFERENCE_MAX_AGE}"
-  --min_usable_actions="${MIN_USABLE_ACTIONS}"
-  --max_joint_delta="${MAX_JOINT_DELTA}"
-  --max_gripper_delta="${MAX_GRIPPER_DELTA}"
-  --max_joint_delta_per_step="${MAX_JOINT_DELTA_PER_STEP}"
-  --max_gripper_delta_per_step="${MAX_GRIPPER_DELTA_PER_STEP}"
-  --shadow_mode="${SHADOW_MODE}"
-  --enable_robot_execution="${ENABLE_ROBOT_EXECUTION}"
-  --debug_visualize_queue_size=True
+  --display_data="${DISPLAY_DATA}"
+  --debug_visualize_queue_size=False
 )
 
-if [[ -n "${MAX_CONTROL_STEPS}" ]]; then
-  CLIENT_CMD+=(--max_control_steps="${MAX_CONTROL_STEPS}")
-fi
-
-echo "Starting continuous async robot client. shadow_mode=${SHADOW_MODE} enable_robot_execution=${ENABLE_ROBOT_EXECUTION}"
-if [[ "${RUN_SECONDS}" == "0" ]]; then
-  "${CLIENT_CMD[@]}" 2>&1 | tee "${CLIENT_STDOUT_LOG}"
-else
-  CLIENT_TIMEOUT_SECONDS="$("${PYTHON_BIN}" - <<PY
+echo "Starting classic async robot client. enable_robot_execution=${ENABLE_ROBOT_EXECUTION}"
+CLIENT_TIMEOUT_SECONDS="$("${PYTHON_BIN}" - <<PY
 import math
 print(int(math.ceil(float("${RUN_SECONDS}") + float("${CLIENT_TIMEOUT_GRACE}"))))
 PY
 )"
-  timeout --signal=INT "${CLIENT_TIMEOUT_SECONDS}" "${CLIENT_CMD[@]}" 2>&1 | tee "${CLIENT_STDOUT_LOG}" || {
-    status=$?
-    if [[ "${status}" != "124" && "${status}" != "130" ]]; then
-      exit "${status}"
-    fi
-  }
-fi
-
-if [[ -s "${TIMELINE_JSONL}" ]]; then
-  PLOT_WINDOW_DURATION="${RUN_SECONDS}"
-  if [[ "${PLOT_WINDOW_DURATION}" == "0" ]]; then
-    PLOT_WINDOW_DURATION="8"
+timeout --signal=INT "${CLIENT_TIMEOUT_SECONDS}" "${CLIENT_CMD[@]}" 2>&1 | tee "${CLIENT_STDOUT_LOG}" || {
+  status=$?
+  if [[ "${status}" != "124" && "${status}" != "130" ]]; then
+    exit "${status}"
   fi
-  "${PYTHON_BIN}" -m lerobot.scripts.plot_async_timeline \
-    --log_path "${TIMELINE_JSONL}" \
-    --output_path "${TIMELINE_PNG}" \
-    --window_start 0 \
-    --window_duration "${PLOT_WINDOW_DURATION}" \
-    --summary_path "${RUN_DIR}/timeline_summary.json" \
-    --seconds_per_inch "${PLOT_SECONDS_PER_INCH}" \
-    --min_fig_width "${PLOT_MIN_FIG_WIDTH}" \
-    --fig_height "${PLOT_FIG_HEIGHT}" \
-    --dpi "${PLOT_DPI}" \
-    --obs_label_stride "${PLOT_OBS_LABEL_STRIDE}" \
-    --inference_label_stride "${PLOT_INFERENCE_LABEL_STRIDE}" \
-    --action_label_stride "${PLOT_ACTION_LABEL_STRIDE}" \
-    --queue_label_stride "${PLOT_QUEUE_LABEL_STRIDE}" \
-    >"${RUN_DIR}/timeline_plot_stdout.log"
-fi
+}
+
+LOG_PATHS="$(find "${TIMELINE_LOG_DIR}" -type f -name '*_latency_*.jsonl' | sort | tr '\n' ' ')"
+env \
+  LOG_PATH="${LOG_PATHS}" \
+  OUTPUT_DIR="${RUN_DIR}" \
+  OUTPUT_PATH="${TIMELINE_PNG}" \
+  SUMMARY_PATH="${RUN_DIR}/timeline_summary.json" \
+  WINDOW_DURATION="${RUN_SECONDS}" \
+  SECONDS_PER_INCH="${PLOT_SECONDS_PER_INCH}" \
+  MIN_FIG_WIDTH="${PLOT_MIN_FIG_WIDTH}" \
+  FIG_HEIGHT="${PLOT_FIG_HEIGHT}" \
+  DPI="${PLOT_DPI}" \
+  OBS_LABEL_STRIDE="${PLOT_OBS_LABEL_STRIDE}" \
+  INFERENCE_LABEL_STRIDE="${PLOT_INFERENCE_LABEL_STRIDE}" \
+  ACTION_LABEL_STRIDE="${PLOT_ACTION_LABEL_STRIDE}" \
+  QUEUE_LABEL_STRIDE="${PLOT_QUEUE_LABEL_STRIDE}" \
+  "${REPO_DIR}/scripts/inference/plot_latest_async_timeline.sh" \
+  >"${RUN_DIR}/timeline_plot_stdout.log" \
+  2>"${RUN_DIR}/timeline_plot_stderr.log"
 
 echo "Run directory: ${RUN_DIR}"
-echo "Timeline JSONL: ${TIMELINE_JSONL}"
+echo "Timeline logs: ${TIMELINE_LOG_DIR}"
 echo "Timeline PNG: ${TIMELINE_PNG}"
+echo "Timeline PDF: ${TIMELINE_PNG%.*}.pdf"
 echo "Server log: ${SERVER_STDOUT_LOG}"
 echo "Client log: ${CLIENT_STDOUT_LOG}"
