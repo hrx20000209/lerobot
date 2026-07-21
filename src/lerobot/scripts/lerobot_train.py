@@ -95,6 +95,8 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    grad_accumulation_steps: int = 1,
+    is_accumulation_boundary: bool = True,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -112,6 +114,13 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        grad_accumulation_steps: Number of micro-batches accumulated per optimizer update. The
+            loss is divided by this before backward(). Default 1 preserves the exact prior
+            behavior (every call is a boundary call).
+        is_accumulation_boundary: Whether this micro-batch is the last one in the current
+            accumulation window — gradient clipping, the optimizer step, `zero_grad()`, and the
+            LR scheduler step only happen on boundary calls. Always True when
+            `grad_accumulation_steps == 1`.
 
     Returns:
         A tuple containing:
@@ -154,34 +163,41 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
+    if grad_accumulation_steps > 1:
+        loss = loss / grad_accumulation_steps
+
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    # Clip gradients if specified
-    if grad_clip_norm > 0:
-        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-    else:
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(), float("inf"), error_if_nonfinite=False
-        )
+    if is_accumulation_boundary:
+        # Clip gradients if specified
+        if grad_clip_norm > 0:
+            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                policy.parameters(), float("inf"), error_if_nonfinite=False
+            )
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+        # Optimizer step
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
-    optimizer.zero_grad()
+        optimizer.zero_grad()
 
-    # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+        # Step through pytorch scheduler at every batch instead of epoch
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
-    # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+        # Update internal buffers if policy has update method
+        if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-    train_metrics.loss = loss.item()
-    train_metrics.grad_norm = grad_norm.item()
-    train_metrics.lr = optimizer.param_groups[0]["lr"]
+        train_metrics.grad_norm = grad_norm.item()
+        train_metrics.lr = optimizer.param_groups[0]["lr"]
+
+    # Report the unscaled per-micro-batch loss regardless of accumulation boundary, so the
+    # running average still reflects every micro-batch seen.
+    train_metrics.loss = loss.item() * grad_accumulation_steps
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
@@ -534,6 +550,36 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    # Optional per-policy training-time validation hook. Duck-typed (no isinstance/type-string
+    # check) so this is a true no-op for every policy except one that defines
+    # `run_lingbo_va_validation` — currently only LingBoVAPolicy. See eval_utils.py for the
+    # metrics/CSV/plotting implementation; nothing LingBoVA-specific lives in this file beyond
+    # this gated dispatch.
+    unwrapped_policy_for_hooks = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    has_custom_validation = is_main_process and hasattr(unwrapped_policy_for_hooks, "run_lingbo_va_validation")
+    custom_metrics_ema = None
+    custom_csv_writer = None
+    if has_custom_validation:
+        from lerobot.policies.lingbo_va.eval_utils import CsvMetricsWriter, TrainMetricsEMA
+
+        custom_metrics_ema = TrainMetricsEMA()
+        custom_csv_writer = CsvMetricsWriter(
+            cfg.output_dir / "train_metrics.csv",
+            columns=[
+                "step",
+                "wall_time",
+                "loss",
+                "loss_video",
+                "loss_action",
+                "loss_ema",
+                "loss_video_ema",
+                "loss_action_ema",
+                "grad_norm",
+                "grad_norm_ema",
+                "lr",
+            ],
+        )
+
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -543,6 +589,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
+        is_accumulation_boundary = (step + 1) % cfg.grad_accumulation_steps == 0 or step + 1 == cfg.steps
         train_tracker, output_dict = update_policy(
             train_tracker,
             policy,
@@ -552,6 +599,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            grad_accumulation_steps=cfg.grad_accumulation_steps,
+            is_accumulation_boundary=is_accumulation_boundary,
         )
         if output_dict:
             for key, value in output_dict.items():
@@ -603,6 +652,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
+                if custom_csv_writer is not None:
+                    ema_row = custom_metrics_ema.update(
+                        step=step,
+                        loss=train_tracker.loss.avg,
+                        loss_video=reduced_policy_metrics.get("loss_video", 0.0),
+                        loss_action=reduced_policy_metrics.get("loss_action", 0.0),
+                        grad_norm=train_tracker.grad_norm.avg,
+                        lr=train_tracker.lr.avg,
+                    )
+                    custom_csv_writer.write_row({"wall_time": time.time(), **ema_row})
             train_tracker.reset_averages()
             policy_metric_sums.clear()
             policy_metric_count = 0
@@ -628,6 +687,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
+
+        if has_custom_validation:
+            # Runs on the main process only; every checkpoint save also forces the (slower)
+            # open-loop episode eval, per Task 2.4 ("every 2000 steps + every checkpoint save").
+            validation_metrics = unwrapped_policy_for_hooks.run_lingbo_va_validation(
+                step=step,
+                output_dir=cfg.output_dir,
+                dataset_repo_id=cfg.dataset.repo_id,
+                dataset_root=cfg.dataset.root,
+                dataset_revision=cfg.dataset.revision,
+                run_open_loop=cfg.save_checkpoint and is_saving_step,
+            )
+            if validation_metrics:
+                logging.info("lingbo_va validation step:%d %s", step, validation_metrics)
+                if wandb_logger:
+                    scalar_metrics = {k: v for k, v in validation_metrics.items() if isinstance(v, int | float)}
+                    wandb_logger.log_dict(scalar_metrics, step, mode="eval")
 
         if cfg.env and is_eval_step:
             if is_main_process:

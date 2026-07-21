@@ -46,6 +46,8 @@ class GigaWorldConfig(PreTrainedConfig):
     state_dim: int = 14
     auto_configure_dims: bool = True
     delta_mask: list[bool] | None = None
+    action_representation: str = "absolute"
+    action_normalization_mode: str = "identity"
 
     # GigaWorld / WAN runtime.
     giga_world_root: Path | None = Path("~/Projects/giga-world-policy")
@@ -103,6 +105,10 @@ class GigaWorldConfig(PreTrainedConfig):
             raise ValueError("crop_mode must be either 'center' or 'random'.")
         if self.torch_dtype not in {"bfloat16", "float16", "float32", "bf16", "fp16", "fp32"}:
             raise ValueError("torch_dtype must be one of bfloat16/float16/float32 or bf16/fp16/fp32.")
+        if self.action_representation not in {"absolute", "delta", "delta_hybrid"}:
+            raise ValueError("action_representation must be one of absolute/delta/delta_hybrid.")
+        if self.action_normalization_mode not in {"identity", "mean_std", "min_max", "quantile"}:
+            raise ValueError("action_normalization_mode must be one of identity/mean_std/min_max/quantile.")
 
     def validate_features(self) -> None:
         if not self.input_features:

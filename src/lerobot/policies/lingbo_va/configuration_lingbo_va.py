@@ -71,6 +71,7 @@ class LingBoVAConfig(PreTrainedConfig):
 
     train_action_head_only: bool = True
     train_video_head: bool = False
+    train_last_n_blocks: int = 0
     use_transformer_lora: bool = False
     transformer_lora_path: Path | None = None
     lora_rank: int = 8
@@ -92,6 +93,45 @@ class LingBoVAConfig(PreTrainedConfig):
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-1
     loss_log_freq: int = 20
+
+    # Classifier-free-guidance text dropout probability during training. Upstream
+    # (`lerobot_latent_dataset.py`) applies this per-sample in the dataset; this port applies it
+    # inline in `_build_training_input` since there is no offline-cached-latent dataset stage.
+    cfg_prob: float = 0.0
+    # Loss combination weights. Upstream default (robotwin/libero, unset) is 1.0/1.0; the
+    # already-validated SO101 config overrides to 0.1/1.0 to keep video reconstruction loss from
+    # dominating the (much smaller) action loss on a small, single-task dataset.
+    video_loss_weight: float = 1.0
+    action_loss_weight: float = 1.0
+
+    scheduler_name: str = "cosine"
+    scheduler_warmup_steps: int = 500
+
+    # Optional explicit path to a `lingbo_va_action_stats.json`-formatted file (see
+    # `_save_action_stats`/`_load_action_stats`) to use instead of `dataset_stats`. Used to force
+    # training to use train-only-scoped normalization stats (e.g. computed via
+    # `scripts/compute_lingbo_va_train_stats.py` over a subset of episodes), and to guarantee
+    # deploy-time inference loads the exact same file via the checkpoint's saved copy.
+    action_stats_path: Path | None = None
+
+    # --- Training-time validation (see LingBoVAPolicy.run_lingbo_va_validation / eval_utils.py) ---
+    # Episode indices held out from training, used only by the validation callback. Never
+    # included in `--dataset.episodes`. Validation is disabled entirely when this is None/empty.
+    val_episodes: list[int] | None = None
+    # Fixed-timestep val loss + teacher-forced action-curve eval run every `val_freq` steps.
+    val_freq: int = 500
+    val_num_samples: int = 32
+    val_seed: int = 12345
+    val_timestep_fractions: tuple[float, ...] = (0.25, 0.5, 0.75)
+    teacher_forced_episode: int = 95
+    teacher_forced_offsets: list[int] = field(
+        default_factory=lambda: [0, 50, 100, 150, 200, 250, 300, 350]
+    )
+    # Full-episode open-loop stride-requery eval runs every `open_loop_freq` steps (and, driven
+    # by the caller, on every checkpoint save).
+    open_loop_freq: int = 2000
+    open_loop_episodes: list[int] = field(default_factory=lambda: [95, 97])
+    open_loop_stride: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -153,6 +193,20 @@ class LingBoVAConfig(PreTrainedConfig):
             raise ValueError("inference_attn_mode must be one of: torch, flashattn, flex.")
         if self.norm_default_mode not in {"q01/q99", "min/max", "z-score"}:
             raise ValueError("norm_default_mode must be one of: q01/q99, min/max, z-score.")
+        if self.train_last_n_blocks < 0:
+            raise ValueError("train_last_n_blocks cannot be negative.")
+        if not 0.0 <= self.cfg_prob < 1.0:
+            raise ValueError("cfg_prob must be in [0, 1).")
+        if self.video_loss_weight < 0:
+            raise ValueError("video_loss_weight cannot be negative.")
+        if self.action_loss_weight < 0:
+            raise ValueError("action_loss_weight cannot be negative.")
+        if self.scheduler_warmup_steps < 0:
+            raise ValueError("scheduler_warmup_steps cannot be negative.")
+        if self.val_freq < 0 or self.open_loop_freq < 0:
+            raise ValueError("val_freq and open_loop_freq cannot be negative.")
+        if self.val_num_samples <= 0:
+            raise ValueError("val_num_samples must be positive.")
 
     def validate_features(self) -> None:
         if not self.input_features:
@@ -192,8 +246,10 @@ class LingBoVAConfig(PreTrainedConfig):
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay, betas=(0.9, 0.95))
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    def get_scheduler_preset(self):
+        from lerobot.optim.schedulers import DiffuserSchedulerConfig
+
+        return DiffuserSchedulerConfig(name=self.scheduler_name, num_warmup_steps=self.scheduler_warmup_steps)
 
     @property
     def observation_delta_indices(self) -> list[int]:

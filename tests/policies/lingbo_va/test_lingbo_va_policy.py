@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from torch import nn
 
@@ -131,3 +132,109 @@ def test_lora_scope_trains_adapters_and_saved_heads_only() -> None:
     assert groups[0]["params"]
     assert groups[1]["params"]
     assert groups[1]["lr"] == 1e-4
+
+
+def _fake_transformer_with_blocks(num_blocks: int = 4) -> nn.Module:
+    class Transformer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_embedder = nn.Linear(2, 2)
+            self.action_proj_out = nn.Linear(2, 2)
+            self.condition_embedder_action = nn.Linear(2, 2)
+            self.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(num_blocks)])
+
+    return Transformer()
+
+
+def test_train_last_n_blocks_unfreezes_only_the_last_n_blocks() -> None:
+    config = LingBoVAConfig(device="cpu", train_action_head_only=True, train_last_n_blocks=2)
+    policy = LingBoVAPolicy(config)
+    transformer = _fake_transformer_with_blocks(num_blocks=4)
+    object.__setattr__(policy, "_transformer", transformer)
+
+    policy._apply_training_freeze()
+
+    assert not any(p.requires_grad for p in transformer.blocks[0].parameters())
+    assert not any(p.requires_grad for p in transformer.blocks[1].parameters())
+    assert all(p.requires_grad for p in transformer.blocks[2].parameters())
+    assert all(p.requires_grad for p in transformer.blocks[3].parameters())
+    assert all(p.requires_grad for p in transformer.action_embedder.parameters())
+
+
+def test_train_last_n_blocks_zero_leaves_all_blocks_frozen() -> None:
+    config = LingBoVAConfig(device="cpu", train_action_head_only=True, train_last_n_blocks=0)
+    policy = LingBoVAPolicy(config)
+    transformer = _fake_transformer_with_blocks(num_blocks=4)
+    object.__setattr__(policy, "_transformer", transformer)
+
+    policy._apply_training_freeze()
+
+    assert not any(p.requires_grad for block in transformer.blocks for p in block.parameters())
+
+
+def test_trainable_param_self_check_raises_below_half_percent() -> None:
+    # A transformer with a huge frozen "backbone" and only a tiny trainable head: trainable% < 0.5%.
+    config = LingBoVAConfig(device="cpu", train_action_head_only=True, train_video_head=False)
+    policy = LingBoVAPolicy(config)
+
+    class Transformer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_embedder = nn.Linear(2, 2)  # tiny trainable head: 6 params
+            self.action_proj_out = nn.Linear(2, 2)
+            self.condition_embedder_action = nn.Linear(2, 2)
+            self.backbone = nn.Linear(10_000, 10_000)  # huge frozen backbone: >1e8 params
+
+    transformer = Transformer()
+    object.__setattr__(policy, "_transformer", transformer)
+
+    with pytest.raises(RuntimeError, match="below the 0.5%"):
+        policy._apply_training_freeze()
+
+
+def test_trainable_param_self_check_passes_for_full_finetune() -> None:
+    config = LingBoVAConfig(device="cpu", train_action_head_only=False, use_transformer_lora=False)
+    policy = LingBoVAPolicy(config)
+    transformer = _fake_transformer_with_blocks(num_blocks=2)
+    object.__setattr__(policy, "_transformer", transformer)
+
+    policy._apply_training_freeze()  # should not raise
+
+    assert all(p.requires_grad for p in transformer.parameters())
+
+
+def test_config_rejects_invalid_new_fields() -> None:
+    with pytest.raises(ValueError, match="cfg_prob"):
+        LingBoVAConfig(device="cpu", cfg_prob=1.5)
+    with pytest.raises(ValueError, match="train_last_n_blocks"):
+        LingBoVAConfig(device="cpu", train_last_n_blocks=-1)
+    with pytest.raises(ValueError, match="video_loss_weight"):
+        LingBoVAConfig(device="cpu", video_loss_weight=-0.1)
+
+
+def test_commit_executed_action_validates_shape_and_alignment() -> None:
+    config = LingBoVAConfig(device="cpu", action_per_frame=8, action_dim=6)
+    config.validate_features()
+    policy = LingBoVAPolicy(config)
+
+    wrong_action_dim = torch.zeros(8, 5)
+    with pytest.raises(ValueError, match="action_dim"):
+        policy.commit_executed_action(wrong_action_dim, obs={})
+
+    not_multiple_of_action_per_frame = torch.zeros(5, 6)
+    with pytest.raises(ValueError, match="multiple of action_per_frame"):
+        policy.commit_executed_action(not_multiple_of_action_per_frame, obs={})
+
+
+def test_forward_rejects_non_flex_train_attn_mode() -> None:
+    config = LingBoVAConfig(device="cpu", train_attn_mode="torch")
+    policy = LingBoVAPolicy(config)
+    with pytest.raises(ValueError, match="train_attn_mode='flex'"):
+        policy.forward({})
+
+
+def test_scheduler_preset_is_cosine_with_configured_warmup() -> None:
+    config = LingBoVAConfig(device="cpu", scheduler_name="cosine", scheduler_warmup_steps=123)
+    preset = config.get_scheduler_preset()
+    assert preset.name == "cosine"
+    assert preset.num_warmup_steps == 123

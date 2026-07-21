@@ -20,6 +20,7 @@ from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
 from .episodic import EpisodicStrategy
 from .factory import create_strategy
 from .highlight import HighlightStrategy
+from .lingbo_va_kv_cache import LingboVaKvCacheStrategy
 from .sentry import SentryStrategy
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "DAggerStrategy",
     "HighlightStrategy",
     "EpisodicStrategy",
+    "LingboVaKvCacheStrategy",
     "RolloutStrategy",
     "SentryStrategy",
     "create_strategy",

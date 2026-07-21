@@ -106,6 +106,14 @@ class TrainPipelineConfig(HubMixin):
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
+    # Number of micro-batches to accumulate gradients over before each optimizer step. `steps`
+    # still counts micro-batches (dataloader fetches), so effective optimizer updates ==
+    # steps // grad_accumulation_steps; checkpoint/log/eval cadence is unchanged (still gated on
+    # the micro-step counter). Default of 1 preserves today's behavior exactly (every micro-step
+    # is an accumulation boundary). Gradients are synced (all-reduce) on every micro-step rather
+    # than only at boundaries, which is a minor communication overhead in multi-GPU runs but not
+    # a correctness issue; single-GPU runs are unaffected.
+    grad_accumulation_steps: int = 1
     use_policy_training_preset: bool = True
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
@@ -133,6 +141,8 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def validate(self) -> None:
+        if self.grad_accumulation_steps < 1:
+            raise ValueError("grad_accumulation_steps must be >= 1.")
         # HACK: We parse again the cli args here to get the pretrained paths if there was some.
         policy_path = parser.get_path_arg("policy")
         reward_model_path = parser.get_path_arg("reward_model")

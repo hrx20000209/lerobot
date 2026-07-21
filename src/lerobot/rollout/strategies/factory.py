@@ -23,6 +23,7 @@ from .core import RolloutStrategy
 from .dagger import DAggerStrategy
 from .episodic import EpisodicStrategy
 from .highlight import HighlightStrategy
+from .lingbo_va_kv_cache import LingboVaKvCacheStrategy
 from .sentry import SentryStrategy
 
 if TYPE_CHECKING:
@@ -45,6 +46,9 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
         return DAggerStrategy(config)
     if config.type == "episodic":
         return EpisodicStrategy(config)
+    if config.type == "lingbo_va_kv_cache":
+        return LingboVaKvCacheStrategy(config)
     raise ValueError(
-        f"Unknown strategy type '{config.type}'. Available: base, sentry, highlight, dagger, episodic"
+        "Unknown strategy type '"
+        f"{config.type}'. Available: base, sentry, highlight, dagger, episodic, lingbo_va_kv_cache"
     )

@@ -61,6 +61,8 @@ class LingBoVAPolicy(PreTrainedPolicy):
         self._dataset_stats = dataset_stats
         self._action_stats = self._extract_action_stats(dataset_stats)
         self._model_action_stats = self._build_model_action_stats()
+        if config.action_stats_path is not None:
+            self._load_action_stats(Path(config.action_stats_path).expanduser())
 
         object.__setattr__(self, "_transformer", None)
         object.__setattr__(self, "_vae", None)
@@ -76,6 +78,9 @@ class LingBoVAPolicy(PreTrainedPolicy):
         object.__setattr__(self, "_local_server", None)
         object.__setattr__(self, "_last_prompt", None)
         object.__setattr__(self, "_forward_calls", 0)
+        object.__setattr__(self, "_freeze_report_done", False)
+        object.__setattr__(self, "_empty_prompt_emb", None)
+        object.__setattr__(self, "_mean_collapse_tracker", None)
         self._prompt_cache: dict[str, Tensor] = {}
 
     @classmethod
@@ -208,13 +213,21 @@ class LingBoVAPolicy(PreTrainedPolicy):
         if local_server is not None:
             local_server.transformer.clear_cache(local_server.cache_name)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], fixed_timesteps: Tensor | None = None) -> tuple[Tensor, dict]:
+        if self.config.train_attn_mode != "flex":
+            raise ValueError(
+                f"LingBoVA training requires train_attn_mode='flex' (got '{self.config.train_attn_mode}'). "
+                "'torch'/'flashattn' attention ops ignore the block-causal training mask entirely "
+                "(FlexAttnFunc.init_mask is only built inside WanTransformer3DModel.forward_train), so "
+                "training with anything other than 'flex' would silently run full bidirectional "
+                "attention across noisy/clean/video/action tokens — a correctness bug, not a perf knob."
+            )
         self._ensure_local_runtime(for_training=True)
         self._apply_training_freeze()
-        input_dict = self._build_training_input(batch)
+        input_dict = self._build_training_input(batch, fixed_timesteps=fixed_timesteps)
         latent_pred, action_pred = self._transformer(input_dict, train_mode=True)
         latent_loss, action_loss = self._compute_loss(input_dict, latent_pred, action_pred)
-        loss = latent_loss + action_loss
+        loss = self.config.video_loss_weight * latent_loss + self.config.action_loss_weight * action_loss
         self._forward_calls += 1
         if self._forward_calls == 1 or (
             self.config.loss_log_freq > 0 and self._forward_calls % self.config.loss_log_freq == 0
@@ -451,25 +464,73 @@ class LingBoVAPolicy(PreTrainedPolicy):
                         module.train()
                         module.requires_grad_(True)
                 transformer.scale_shift_table.requires_grad_(True)
+            if self.config.train_last_n_blocks > 0:
+                blocks = getattr(transformer, "blocks", None)
+                if blocks is None:
+                    raise AttributeError(
+                        "LingBoVA transformer has no `.blocks` attribute; train_last_n_blocks is unsupported."
+                    )
+                for block in blocks[-self.config.train_last_n_blocks :]:
+                    block.train()
+                    block.requires_grad_(True)
         for module in (getattr(self, "_vae", None), getattr(self, "_text_encoder", None)):
             if module is not None and self.config.freeze_vision_text_encoder:
                 module.eval()
                 module.requires_grad_(False)
+        if not getattr(self, "_freeze_report_done", False):
+            self._report_trainable_params(transformer)
+            object.__setattr__(self, "_freeze_report_done", True)
 
-    def _build_training_input(self, batch: dict[str, Any]) -> dict[str, Any]:
+    def _report_trainable_params(self, transformer: Any) -> None:
+        total = sum(p.numel() for p in transformer.parameters())
+        trainable = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
+        pct = 100.0 * trainable / max(total, 1)
+        trainable_module_prefixes = sorted(
+            {name.split(".")[0] for name, p in transformer.named_parameters() if p.requires_grad}
+        )
+        logging.info(
+            "LingBoVA trainable params: %d / %d (%.4f%%). Trainable top-level modules: %s",
+            trainable,
+            total,
+            pct,
+            trainable_module_prefixes,
+        )
+        if pct < 0.5:
+            raise RuntimeError(
+                f"LingBoVA trainable parameters are {pct:.4f}% of the transformer, below the 0.5% "
+                "sanity floor. This almost always means the freeze configuration froze everything "
+                "that matters (e.g. train_action_head_only=true with use_transformer_lora=false and "
+                "train_last_n_blocks=0, which never unfreezes any transformer block). Check "
+                "train_action_head_only / use_transformer_lora / train_last_n_blocks."
+            )
+
+    def _build_training_input(
+        self, batch: dict[str, Any], fixed_timesteps: Tensor | None = None
+    ) -> dict[str, Any]:
         latents = self._encode_video_latents(batch)
         actions, actions_mask = self._build_model_actions(batch)
         prompts = self._build_prompts(batch, batch_size=latents.shape[0])
         text_emb = self._encode_prompts(prompts).to(device=latents.device, dtype=latents.dtype)
 
+        if self.training and self.config.cfg_prob > 0.0 and fixed_timesteps is None:
+            drop_mask = torch.rand(text_emb.shape[0], device=text_emb.device) < self.config.cfg_prob
+            if drop_mask.any():
+                empty_emb = self._empty_prompt_embedding().to(device=text_emb.device, dtype=text_emb.dtype)
+                text_emb = torch.where(drop_mask[:, None, None], empty_emb[None], text_emb)
+
         latent_dict = self._add_noise(
-            latents, self._train_scheduler_latent, action_mask=None, action_mode=False
+            latents,
+            self._train_scheduler_latent,
+            action_mask=None,
+            action_mode=False,
+            fixed_timesteps=fixed_timesteps,
         )
         action_dict = self._add_noise(
             actions,
             self._train_scheduler_action,
             action_mask=actions_mask,
             action_mode=True,
+            fixed_timesteps=fixed_timesteps,
         )
         latent_dict["text_emb"] = text_emb
         action_dict["text_emb"] = text_emb
@@ -481,15 +542,36 @@ class LingBoVAPolicy(PreTrainedPolicy):
             "window_size": self.config.attn_window,
         }
 
+    def _empty_prompt_embedding(self) -> Tensor:
+        if self._empty_prompt_emb is None:
+            with torch.no_grad():
+                emb = self._encode_prompts([""])[0]
+            object.__setattr__(self, "_empty_prompt_emb", emb)
+        return self._empty_prompt_emb
+
     @torch.no_grad()
     def _add_noise(
-        self, latent: Tensor, train_scheduler: Any, action_mask: Tensor | None, action_mode: bool
+        self,
+        latent: Tensor,
+        train_scheduler: Any,
+        action_mask: Tensor | None,
+        action_mode: bool,
+        fixed_timesteps: Tensor | None = None,
     ) -> dict[str, Tensor]:
         batch_size, _, num_frames, height, width = latent.shape
-        sample_timestep_id = self._lingbo_utils["sample_timestep_id"]
-        timestep_ids = sample_timestep_id(
-            batch_size=num_frames, num_train_timesteps=train_scheduler.num_train_timesteps
-        )
+        if fixed_timesteps is not None:
+            fractions = fixed_timesteps.to(torch.float64)
+            timestep_ids = (fractions * train_scheduler.num_train_timesteps).long()
+            timestep_ids = timestep_ids.clamp(min=0, max=train_scheduler.num_train_timesteps - 1)
+            if timestep_ids.numel() == 1:
+                timestep_ids = timestep_ids.expand(num_frames)
+            elif timestep_ids.numel() != num_frames:
+                timestep_ids = timestep_ids[torch.arange(num_frames) % timestep_ids.numel()]
+        else:
+            sample_timestep_id = self._lingbo_utils["sample_timestep_id"]
+            timestep_ids = sample_timestep_id(
+                batch_size=num_frames, num_train_timesteps=train_scheduler.num_train_timesteps
+            )
         noise = torch.zeros_like(latent).normal_()
         timesteps = train_scheduler.timesteps[timestep_ids].to(device=latent.device)
         noisy_latents = train_scheduler.add_noise(latent, noise, timesteps, t_dim=2)
@@ -879,6 +961,13 @@ class LingBoVAPolicy(PreTrainedPolicy):
         return payload
 
     def _predict_action_chunk_server(self, batch: dict[str, Any]) -> Tensor:
+        # NOTE: this call intentionally does NOT send `compute_kv_cache` — that would require
+        # knowing which actions were *actually executed* (post safety-clip) on the robot, which
+        # is only known outside this policy, by the rollout loop. Committing the previous
+        # chunk's executed actions (and thereby advancing the server's `frame_st_id`) is the
+        # caller's responsibility via `commit_executed_action()`, which must be invoked once per
+        # chunk boundary before the next `predict_action_chunk` call. See
+        # `LingboVaKvCacheStrategy` in `src/lerobot/rollout/strategies/lingbo_va_kv_cache.py`.
         client = self._ensure_server_client()
         prompt = self._build_prompts(batch, batch_size=1)[0]
         if prompt != self._last_prompt:
@@ -890,6 +979,7 @@ class LingBoVAPolicy(PreTrainedPolicy):
         return self._server_action_to_tensor(response["action"])
 
     def _predict_action_chunk_local(self, batch: dict[str, Any]) -> Tensor:
+        # See the NOTE in `_predict_action_chunk_server` above — same caveat applies here.
         server = self._ensure_local_server()
         prompt = self._build_prompts(batch, batch_size=1)[0]
         if prompt != self._last_prompt:
@@ -899,6 +989,65 @@ class LingBoVAPolicy(PreTrainedPolicy):
             object.__setattr__(self, "_last_prompt", prompt)
         response = server.infer(self._make_server_payload(batch, reset=False))
         return self._server_action_to_tensor(response["action"])
+
+    def _build_kv_cache_payload(self, executed_action_chunk: Tensor, obs: dict[str, Any]) -> dict[str, Any]:
+        """Pure `compute_kv_cache` payload builder — no dispatch. Shared by `commit_executed_action`
+        (dispatches via the policy's configured server/local backend) and by `eval_utils`'
+        in-process weight-sharing server (Task 2.4's open-loop eval), which must send this payload
+        directly to ITS OWN server object rather than through `commit_executed_action`'s dispatch
+        — that would open a websocket to `server_host`/`server_port` (nothing listens there during
+        training) or spin up a second, independent, disk-loaded `VA_Server` (doubling GPU memory).
+
+        `executed_action_chunk`: Tensor of shape (T, action_dim) in raw (un-normalized) per-step
+        dataset-action units. `T` must be a multiple of `config.action_per_frame` (commonly
+        `T == config.n_action_steps`), since the server's KV cache operates on whole latent-frame
+        granularity. `obs`: the observation batch used to encode the camera frames committed
+        alongside the actions.
+        """
+        if executed_action_chunk.ndim != 2 or executed_action_chunk.shape[-1] != self.config.action_dim:
+            raise ValueError(
+                "commit_executed_action expects shape (T, action_dim="
+                f"{self.config.action_dim}), got {tuple(executed_action_chunk.shape)}."
+            )
+        num_steps = executed_action_chunk.shape[0]
+        if num_steps % self.config.action_per_frame != 0:
+            raise ValueError(
+                f"commit_executed_action received {num_steps} executed steps, which is not a "
+                f"multiple of action_per_frame={self.config.action_per_frame}. Configure "
+                "n_action_steps to be a multiple of action_per_frame so executed chunks align "
+                "with the server's KV-cache latent-frame granularity."
+            )
+        num_frames = num_steps // self.config.action_per_frame
+        arr = executed_action_chunk.detach().cpu().numpy().astype(np.float32)
+        arr = arr.reshape(num_frames, self.config.action_per_frame, self.config.action_dim)
+        arr = np.transpose(arr, (2, 0, 1))  # -> [action_dim, num_frames, action_per_frame]
+
+        payload = self._make_server_payload(obs, reset=False)
+        payload["compute_kv_cache"] = True
+        payload["imagine"] = False
+        payload["pred_action"] = arr
+        return payload
+
+    def commit_executed_action(self, executed_action_chunk: Tensor, obs: dict[str, Any]) -> None:
+        """Commit actually-executed actions to the inference server's KV cache.
+
+        Must be called exactly once per action-chunk boundary — after the robot has executed the
+        actions `select_action` returned for the current chunk, and before the next
+        `predict_action_chunk` call fires — mirroring the upstream protocol: reset once -> infer
+        chunk -> execute chunk -> compute_kv_cache(executed actions) -> infer next chunk -> ...
+        Without this call, the server's `frame_st_id` never advances and every
+        `predict_action_chunk` call silently replans from scratch instead of streaming.
+
+        See `_build_kv_cache_payload` for the argument contract. This method dispatches the
+        resulting payload via `config.inference_backend` (server websocket or local disk-loaded
+        `VA_Server`) — for the in-process training-time eval server, call
+        `server.infer(policy._build_kv_cache_payload(...))` directly instead.
+        """
+        payload = self._build_kv_cache_payload(executed_action_chunk, obs)
+        if self.config.inference_backend == "server":
+            self._ensure_server_client().infer(payload)
+        else:
+            self._ensure_local_server().infer(payload)
 
     def _server_action_to_tensor(self, action: Any) -> Tensor:
         arr = np.asarray(action, dtype=np.float32)
@@ -1000,6 +1149,102 @@ class LingBoVAPolicy(PreTrainedPolicy):
         server = VA_Server(self._make_va_job_config())
         object.__setattr__(self, "_local_server", server)
         return server
+
+    def run_lingbo_va_validation(
+        self,
+        step: int,
+        output_dir: Path,
+        dataset_repo_id: str,
+        dataset_root: Any,
+        dataset_revision: Any,
+        run_open_loop: bool,
+    ) -> dict[str, Any]:
+        """Entry point for `lerobot_train.py`'s duck-typed validation hook (see the `hasattr`
+        check there — this method existing at all is what turns the hook on for this policy).
+
+        Dispatches to `eval_utils`'s fixed-timestep / teacher-forced / open-loop routines based
+        on `step` and `self.config.val_freq`/`open_loop_freq`, writes plots/CSV/markdown, and
+        returns a flat dict of scalars for the caller to log to wandb (mode="eval").
+        """
+        if not self.config.val_episodes:
+            return {}
+        from . import eval_utils
+
+        output_dir = Path(output_dir)
+        results: dict[str, Any] = {}
+
+        is_val_step = self.config.val_freq > 0 and step % self.config.val_freq == 0
+        is_open_loop_step = run_open_loop or (
+            self.config.open_loop_freq > 0 and step % self.config.open_loop_freq == 0
+        )
+        if not is_val_step and not is_open_loop_step:
+            return {}
+
+        was_training = self.training
+        if is_val_step:
+            val_metrics = eval_utils.run_fixed_timestep_validation(
+                self,
+                dataset_repo_id,
+                dataset_root,
+                dataset_revision,
+                self.config.val_episodes,
+                timestep_fractions=tuple(self.config.val_timestep_fractions),
+                num_samples=self.config.val_num_samples,
+                seed=self.config.val_seed,
+            )
+            results.update(val_metrics)
+
+            tf_metrics = eval_utils.run_teacher_forced_eval(
+                self,
+                dataset_repo_id,
+                dataset_root,
+                dataset_revision,
+                episode_id=self.config.teacher_forced_episode,
+                offsets=list(self.config.teacher_forced_offsets),
+                output_dir=output_dir / "eval_curves",
+                step=step,
+            )
+            if tf_metrics:
+                results["teacher_forced/total_mae"] = tf_metrics["teacher_forced/total_mae"]
+                results["teacher_forced/direction_consistency"] = tf_metrics[
+                    "teacher_forced/direction_consistency"
+                ]
+                results["teacher_forced/min_std_ratio"] = tf_metrics["teacher_forced/min_std_ratio"]
+                for name, mae in tf_metrics["teacher_forced/per_joint_mae"].items():
+                    results[f"teacher_forced/mae_{name}"] = mae
+                if self._mean_collapse_tracker is None:
+                    object.__setattr__(self, "_mean_collapse_tracker", eval_utils.TrainMetricsEMA())
+                self._mean_collapse_tracker.check_mean_collapse(tf_metrics["teacher_forced/min_std_ratio"])
+
+        if is_open_loop_step:
+            for episode_id in self.config.open_loop_episodes:
+                ol_metrics = eval_utils.run_open_loop_episode_eval(
+                    self,
+                    dataset_repo_id,
+                    dataset_root,
+                    dataset_revision,
+                    episode_id=episode_id,
+                    stride=self.config.open_loop_stride,
+                    output_dir=output_dir / "eval_curves",
+                    step=step,
+                )
+                if not ol_metrics:
+                    continue
+                results[f"open_loop/total_mae_ep{episode_id}"] = ol_metrics["open_loop/total_mae"]
+                results[f"open_loop/direction_consistency_ep{episode_id}"] = ol_metrics[
+                    "open_loop/direction_consistency"
+                ]
+                for name, mae in ol_metrics["open_loop/per_joint_mae"].items():
+                    results[f"open_loop/mae_ep{episode_id}_{name}"] = mae
+
+        if was_training:
+            self.train()
+
+        eval_utils.write_markdown_row(
+            output_dir / "validation_summary.md",
+            {"step": step, **{k: round(v, 6) if isinstance(v, float) else v for k, v in results.items()}},
+        )
+        return results
 
 
 def _pack_array(obj):

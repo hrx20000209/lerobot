@@ -540,6 +540,8 @@ class GigaWorldPolicy(PreTrainedPolicy):
         source = None
         if self._stats is not None:
             source = self._stats.get("norm_stats", {}).get(key, {}).get(stat)
+            if source is None and key == self.config.action_key:
+                source = self._stats.get("norm_stats", {}).get("hybrid_action", {}).get(stat)
         if source is None and self._dataset_stats is not None:
             source = self._dataset_stats.get(key, {}).get(stat)
         if source is None:
