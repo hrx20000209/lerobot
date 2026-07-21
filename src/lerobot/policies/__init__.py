@@ -17,12 +17,12 @@ from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterp
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config as EO1Config
+from .evo1.configuration_evo1 import Evo1Config as Evo1Config
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
-from .fast_wam.configuration_fast_wam import FastWAMConfig as FastWAMConfig
+from .fastwam.configuration_fastwam import FastWAMConfig as FastWAMConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
-from .giga_world.configuration_giga_world import GigaWorldConfig as GigaWorldConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
-from .lingbo_va.configuration_lingbo_va import LingBoVAConfig as LingBoVAConfig
+from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
@@ -45,13 +45,13 @@ __all__ = [
     # Configuration classes
     "ACTConfig",
     "DiffusionConfig",
-    "FastWAMConfig",
     "EO1Config",
+    "FastWAMConfig",
     "GaussianActorConfig",
-    "GigaWorldConfig",
+    "Evo1Config",
     "GrootConfig",
+    "LingBotVAConfig",
     "MolmoAct2Config",
-    "LingBoVAConfig",
     "MultiTaskDiTConfig",
     "PI0Config",
     "PI0FastConfig",

@@ -19,11 +19,10 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
-import json
 import logging
+import sys
 import time
 from contextlib import nullcontext
-from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -36,19 +35,24 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
     get_step_identifier,
+    load_fsdp_optimizer_state,
     load_training_batch_size,
     load_training_num_processes,
     load_training_state,
+    push_checkpoint_to_hub,
     save_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.common.wandb_utils import WandBLogger
-from lerobot.configs import parser
+from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state, make_dataset
+from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
+from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
@@ -67,24 +71,6 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
-def _filter_local_processor_overrides(
-    pretrained_path: str | Path, filename: str, overrides: dict[str, dict]
-) -> dict[str, dict]:
-    config_path = Path(pretrained_path).expanduser() / filename
-    if not config_path.exists():
-        return overrides
-    with open(config_path, encoding="utf-8") as config_file:
-        data = json.load(config_file)
-    available = set()
-    for step in data.get("steps", []):
-        if registry_name := step.get("registry_name"):
-            available.add(registry_name)
-        if class_name := step.get("class"):
-            available.add(class_name)
-            available.add(class_name.rsplit(".", 1)[-1])
-    return {key: value for key, value in overrides.items() if key in available}
-
-
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -95,8 +81,6 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
-    grad_accumulation_steps: int = 1,
-    is_accumulation_boundary: bool = True,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -114,13 +98,6 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
-        grad_accumulation_steps: Number of micro-batches accumulated per optimizer update. The
-            loss is divided by this before backward(). Default 1 preserves the exact prior
-            behavior (every call is a boundary call).
-        is_accumulation_boundary: Whether this micro-batch is the last one in the current
-            accumulation window — gradient clipping, the optimizer step, `zero_grad()`, and the
-            LR scheduler step only happen on boundary calls. Always True when
-            `grad_accumulation_steps == 1`.
 
     Returns:
         A tuple containing:
@@ -163,44 +140,40 @@ def update_policy(
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
-    if grad_accumulation_steps > 1:
-        loss = loss / grad_accumulation_steps
-
     # Use accelerator's backward method
     accelerator.backward(loss)
 
-    if is_accumulation_boundary:
-        # Clip gradients if specified
-        if grad_clip_norm > 0:
-            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                policy.parameters(), float("inf"), error_if_nonfinite=False
-            )
+    # Clip gradients if specified
+    if grad_clip_norm > 0:
+        grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(), float("inf"), error_if_nonfinite=False
+        )
 
-        # Optimizer step
-        with lock if lock is not None else nullcontext():
-            optimizer.step()
+    # Optimizer step
+    with lock if lock is not None else nullcontext():
+        optimizer.step()
 
-        optimizer.zero_grad()
+    optimizer.zero_grad()
 
-        # Step through pytorch scheduler at every batch instead of epoch
-        if lr_scheduler is not None:
-            lr_scheduler.step()
+    # Step through pytorch scheduler at every batch instead of epoch
+    if lr_scheduler is not None:
+        lr_scheduler.step()
 
-        # Update internal buffers if policy has update method
-        if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
-            accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+    # Update internal buffers if policy has update method
+    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+        accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
 
-        train_metrics.grad_norm = grad_norm.item()
-        train_metrics.lr = optimizer.param_groups[0]["lr"]
-
-    # Report the unscaled per-micro-batch loss regardless of accumulation boundary, so the
-    # running average still reflects every micro-batch seen.
-    train_metrics.loss = loss.item() * grad_accumulation_steps
+    train_metrics.loss = loss.item()
+    train_metrics.grad_norm = grad_norm.item()
+    train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     if torch.cuda.is_available():
         train_metrics.gpu_mem_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    # Aggregate the policy's scalar outputs for logging and rank-reduction across the log window.
+    if output_dict:
+        train_metrics.update_metrics(output_dict)
     return train_metrics, output_dict
 
 
@@ -221,10 +194,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
+    if cfg.job.is_remote:
+        return submit_to_hf(cfg)
+
     from lerobot.utils.import_utils import require_package
 
     require_package("accelerate", extra="training")
     from accelerate import Accelerator
+    from accelerate.utils import DistributedDataParallelKwargs, DistributedType
 
     cfg.validate()
 
@@ -233,14 +210,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
-
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
         force_cpu = cfg.trainable_config.device == "cpu"
+        # Drive Accelerate's autocast from policy.dtype (bf16/fp16 activate it; float32/absent -> launcher default).
+        policy_dtype = getattr(cfg.trainable_config, "dtype", None)
+        mixed_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}.get(policy_dtype)
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
+            mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
         )
@@ -280,19 +259,19 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # LeRobotDataset skips its snapshot_download when try_load() succeeds, so no rank re-downloads.
     if is_main_process:
         logging.info("Creating dataset")
-        dataset = make_dataset(cfg)
+        dataset, eval_dataset = make_train_eval_datasets(cfg)
 
     accelerator.wait_for_everyone()
 
     # Other ranks read from the shared copy populated by the main process.
     if not is_main_process:
-        dataset = make_dataset(cfg)
+        dataset, eval_dataset = make_train_eval_datasets(cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
     eval_env = None
-    if cfg.eval_freq > 0 and cfg.env is not None and is_main_process:
+    if cfg.env_eval_freq > 0 and cfg.env is not None and is_main_process:
         logging.info("Creating env")
         eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
@@ -369,12 +348,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 "action_names": getattr(active_cfg, "action_feature_names", None),
             }
             postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
-        preprocessor_overrides = _filter_local_processor_overrides(
-            processor_pretrained_path, "policy_preprocessor.json", preprocessor_overrides
-        )
-        postprocessor_overrides = _filter_local_processor_overrides(
-            processor_pretrained_path, "policy_postprocessor.json", postprocessor_overrides
-        )
         processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
         processor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
@@ -387,6 +360,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,
             pretrained_path=processor_pretrained_path,
+            pretrained_revision=getattr(cfg.policy, "pretrained_revision", None),
             **processor_kwargs,
         )
 
@@ -412,7 +386,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
-        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
+        # Under FSDP the optimizer state is sharded and must be loaded after `accelerator.prepare()`
+        # (see load_fsdp_optimizer_state below), so skip the optimizer here and load it then.
+        is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+        step, optimizer, lr_scheduler = load_training_state(
+            cfg.checkpoint_path, optimizer, lr_scheduler, load_optimizer=not is_fsdp
+        )
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
@@ -448,6 +427,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
             shuffle=True,
             seed=cfg.seed if cfg.seed is not None else 0,
+            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
         )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
@@ -497,11 +477,49 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
 
+    # Build eval dataloader if a held-out split exists
+    eval_dataloader = None
+    if eval_dataset is not None:
+        eval_ds = eval_dataset
+        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+            task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
+            unique_tasks = sorted(set(task_arr.tolist()))
+            per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
+            selected: list[int] = []
+            for t in unique_tasks:
+                frames = (task_arr == t).nonzero()[0][:per_task]
+                selected.extend(frames.tolist())
+            eval_ds = torch.utils.data.Subset(eval_dataset, selected)
+
+        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            collate_fn=eval_collate_fn,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if eval_dataloader is not None:
+        policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler, eval_dataloader
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
+
+    # FSDP optimizer state is sharded across ranks, so it can only be loaded once the optimizer and
+    # model are FSDP-wrapped (i.e. after `prepare`). Collective: every rank must participate.
+    if cfg.resume and accelerator.distributed_type == DistributedType.FSDP:
+        load_fsdp_optimizer_state(policy, optimizer, cfg.checkpoint_path)
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -534,8 +552,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         initial_step=step,
         accelerator=accelerator,
     )
-    policy_metric_sums: dict[str, float] = {}
-    policy_metric_count = 0
 
     if is_main_process:
         progbar = tqdm(
@@ -550,36 +566,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    # Optional per-policy training-time validation hook. Duck-typed (no isinstance/type-string
-    # check) so this is a true no-op for every policy except one that defines
-    # `run_lingbo_va_validation` — currently only LingBoVAPolicy. See eval_utils.py for the
-    # metrics/CSV/plotting implementation; nothing LingBoVA-specific lives in this file beyond
-    # this gated dispatch.
-    unwrapped_policy_for_hooks = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-    has_custom_validation = is_main_process and hasattr(unwrapped_policy_for_hooks, "run_lingbo_va_validation")
-    custom_metrics_ema = None
-    custom_csv_writer = None
-    if has_custom_validation:
-        from lerobot.policies.lingbo_va.eval_utils import CsvMetricsWriter, TrainMetricsEMA
-
-        custom_metrics_ema = TrainMetricsEMA()
-        custom_csv_writer = CsvMetricsWriter(
-            cfg.output_dir / "train_metrics.csv",
-            columns=[
-                "step",
-                "wall_time",
-                "loss",
-                "loss_video",
-                "loss_action",
-                "loss_ema",
-                "loss_video_ema",
-                "loss_action_ema",
-                "grad_norm",
-                "grad_norm_ema",
-                "lr",
-            ],
-        )
-
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
@@ -589,8 +575,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        is_accumulation_boundary = (step + 1) % cfg.grad_accumulation_steps == 0 or step + 1 == cfg.steps
-        train_tracker, output_dict = update_policy(
+        train_tracker, _ = update_policy(
             train_tracker,
             policy,
             batch,
@@ -599,16 +584,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
-            grad_accumulation_steps=cfg.grad_accumulation_steps,
-            is_accumulation_boundary=is_accumulation_boundary,
         )
-        if output_dict:
-            for key, value in output_dict.items():
-                if isinstance(value, torch.Tensor):
-                    value = value.detach().float().mean().item()
-                if isinstance(value, int | float):
-                    policy_metric_sums[key] = policy_metric_sums.get(key, 0.0) + float(value)
-            policy_metric_count += 1
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
         # increment `step` here.
@@ -618,20 +594,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
-        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
+        is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
         if is_log_step:
             # Collective reduce must run on every rank, before the main-process gate below.
             train_tracker.reduce_across_ranks()
-            reduced_policy_metrics = {}
-            if policy_metric_count > 0:
-                for key in sorted(policy_metric_sums):
-                    local_average = torch.tensor(
-                        policy_metric_sums[key] / policy_metric_count,
-                        device=accelerator.device,
-                        dtype=torch.float32,
-                    )
-                    reduced_policy_metrics[key] = accelerator.reduce(local_average, reduction="mean").item()
             if is_main_process:
                 # Cluster-wide throughput, derived from the already-reduced (max) step time so it
                 # reflects the slowest rank — which is what actually gates the next iteration.
@@ -639,34 +607,50 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if step_time > 0:
                     train_tracker.samples_per_s = effective_batch_size / step_time
                 logging.info(train_tracker)
-                if reduced_policy_metrics:
-                    metrics_text = " ".join(
-                        f"{key}:{value:.6f}" for key, value in reduced_policy_metrics.items()
-                    )
-                    logging.info("policy_metrics step:%d %s", step, metrics_text)
                 if wandb_logger:
+                    # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
+                    # tracker by update_policy, so to_dict() already carries their windowed,
+                    # rank-reduced averages — no per-step output_dict passthrough needed.
                     wandb_log_dict = train_tracker.to_dict()
-                    wandb_log_dict.update(reduced_policy_metrics)
                     # Log sample weighting statistics if enabled
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
-                if custom_csv_writer is not None:
-                    ema_row = custom_metrics_ema.update(
-                        step=step,
-                        loss=train_tracker.loss.avg,
-                        loss_video=reduced_policy_metrics.get("loss_video", 0.0),
-                        loss_action=reduced_policy_metrics.get("loss_action", 0.0),
-                        grad_norm=train_tracker.grad_norm.avg,
-                        lr=train_tracker.lr.avg,
-                    )
-                    custom_csv_writer.write_row({"wall_time": time.time(), **ema_row})
             train_tracker.reset_averages()
-            policy_metric_sums.clear()
-            policy_metric_count = 0
+
+        if is_eval_step:
+            policy.eval()
+            eval_loss_sum = 0.0
+            n_eval_batches = 0
+            with torch.no_grad(), accelerator.autocast():
+                for eval_batch in eval_dataloader:
+                    for cam_key in dataset.meta.camera_keys:
+                        if cam_key in eval_batch and eval_batch[cam_key].dtype == torch.uint8:
+                            eval_batch[cam_key] = eval_batch[cam_key].to(dtype=torch.float32) / 255.0
+                    eval_batch = preprocessor(eval_batch)
+                    loss, _ = policy.forward(eval_batch)
+                    eval_loss_sum += loss.item()
+                    n_eval_batches += 1
+            eval_loss = eval_loss_sum / max(n_eval_batches, 1)
+            eval_loss = torch.tensor(eval_loss, device=device)
+            eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
+            policy.train()
+
+            if is_main_process:
+                logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
+            # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
+            # so all ranks must participate; rank 0 then writes the materialized dicts. For DDP /
+            # single-GPU the state dicts are saved the normal way inside save_checkpoint.
+            is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+            if is_fsdp:
+                model_state_dict, optim_state_dict = gather_fsdp_state_dicts(policy, optimizer)
+            else:
+                model_state_dict, optim_state_dict = None, None
             if is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
@@ -681,31 +665,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     postprocessor=postprocessor,
                     num_processes=accelerator.num_processes,
                     batch_size=cfg.batch_size,
+                    model_state_dict=model_state_dict,
+                    optim_state_dict=optim_state_dict,
                 )
                 update_last_checkpoint(checkpoint_dir)
+                if cfg.save_checkpoint_to_hub:
+                    push_checkpoint_to_hub(
+                        checkpoint_dir,
+                        cfg.policy.repo_id,
+                        private=cfg.policy.private,
+                    )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
             accelerator.wait_for_everyone()
 
-        if has_custom_validation:
-            # Runs on the main process only; every checkpoint save also forces the (slower)
-            # open-loop episode eval, per Task 2.4 ("every 2000 steps + every checkpoint save").
-            validation_metrics = unwrapped_policy_for_hooks.run_lingbo_va_validation(
-                step=step,
-                output_dir=cfg.output_dir,
-                dataset_repo_id=cfg.dataset.repo_id,
-                dataset_root=cfg.dataset.root,
-                dataset_revision=cfg.dataset.revision,
-                run_open_loop=cfg.save_checkpoint and is_saving_step,
-            )
-            if validation_metrics:
-                logging.info("lingbo_va validation step:%d %s", step, validation_metrics)
-                if wandb_logger:
-                    scalar_metrics = {k: v for k, v in validation_metrics.items() if isinstance(v, int | float)}
-                    wandb_logger.log_dict(scalar_metrics, step, mode="eval")
-
-        if cfg.env and is_eval_step:
+        if cfg.env and is_env_eval_step:
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
@@ -760,6 +735,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if eval_env:
         close_envs(eval_env)
 
+    is_fsdp = accelerator.distributed_type == DistributedType.FSDP
+    model_state_dict = accelerator.get_state_dict(policy) if is_fsdp else None
     if is_main_process:
         logging.info("End of training")
 
@@ -767,9 +744,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             unwrapped_model = accelerator.unwrap_model(policy)
             # PEFT only applies when training a policy — reward models use the plain path.
             if not cfg.is_reward_model_training and cfg.policy.use_peft:
-                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model)
+                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model, dataset_meta=dataset.meta)
             else:
-                unwrapped_model.push_model_to_hub(cfg)
+                unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
 
@@ -778,8 +755,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator.end_training()
 
 
+def _remote_target_in_argv() -> bool:
+    """True when the CLI requests a remote HF Jobs run (--job.target=<non-local>)."""
+    target = None
+    args = sys.argv[1:]
+    for i, tok in enumerate(args):
+        if tok == "--job.target" and i + 1 < len(args):
+            target = args[i + 1]
+        elif tok.startswith("--job.target="):
+            target = tok.split("=", 1)[1]
+    return JobConfig.is_remote_target(target)
+
+
 def main():
     register_third_party_plugins()
+    if _remote_target_in_argv():
+        # The policy device is resolved on the remote pod, not here, so silence the
+        # client-side "Device '...' is not available" warning PreTrainedConfig emits
+        # while parsing the config (it fires before train() can dispatch remotely).
+        logging.getLogger("lerobot.configs.policies").setLevel(logging.ERROR)
     train()
 
 
