@@ -22,6 +22,10 @@ DEFAULT_INFERENCE_LATENCY = 1 / DEFAULT_FPS
 """Server side: Timeout for observation queue in seconds"""
 DEFAULT_OBS_QUEUE_TIMEOUT = 2
 
+"""Server side: Cap on observations buffered between predictions for policies that consume the
+observation stream (see PolicyServer._record_observation_history). Only the most recent are kept."""
+MAX_OBSERVATION_HISTORY = 512
+
 # All action chunking policies. Keep names in their canonical policy factory form.
 SUPPORTED_POLICIES = [
     "act",
@@ -35,6 +39,7 @@ SUPPORTED_POLICIES = [
     "groot",
     "fast_wam",
     "vla_jepa",
+    "lingbot_va",
 ]
 
 # Backward-compatible CLI aliases. Some scripts and checkpoints refer to VLA-JEPA with a hyphen,

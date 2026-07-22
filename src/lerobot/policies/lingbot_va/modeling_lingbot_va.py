@@ -31,7 +31,10 @@ to LeRobot's ``select_action`` interface:
 NOTE: The streaming path is written for single-environment eval (``--eval.batch_size=1``).
 """
 
+import logging
+import time
 from collections import deque
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -101,7 +104,32 @@ class LingBotVAPolicy(PreTrainedPolicy):
 
         self.last_predicted_frames: Tensor | None = None
         self.last_predicted_latents: Tensor | None = None
+        # Per-stage timings (ms) for the most recent chunk. PolicyServer._extract_policy_profile
+        # picks this up and folds it into the async latency log, so a live run yields a real
+        # breakdown instead of one opaque "inference" number.
+        self.last_latency_profile: dict[str, float] = {}
+        self._profiling: bool = True
+        self._stage_totals: dict[str, float] = {}
         self.reset()
+
+    @contextmanager
+    def _stage(self, name: str):
+        """Time one inference stage into ``last_latency_profile`` (CUDA-synchronised)."""
+        if not self._profiling:
+            yield
+            return
+        device = self.config.device
+        is_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+        if is_cuda:
+            torch.cuda.synchronize(torch.device(str(device)))
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if is_cuda:
+                torch.cuda.synchronize(torch.device(str(device)))
+            ms = (time.perf_counter() - t0) * 1000
+            self._stage_totals[name] = self._stage_totals.get(name, 0.0) + ms
 
     # Frozen-module lazy loading (VAE + UMT5 + tokenizer)
     def _ensure_frozen_modules(self):
@@ -435,16 +463,57 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self._exec_step += 1
         return self._action_queue.popleft()
 
+    @property
+    def observation_history_size(self) -> int:
+        """Number of keyframes the KV feedback consumes per chunk.
+
+        ``select_action`` buffers exactly this many observations while draining a chunk (one
+        per executed sub-step, sampled at ``_keyframe_stride``). The streaming VAE's x4
+        temporal downsample turns them into ``frame_chunk_size`` latent frames, which is what
+        ``_compute_kv_cache`` feeds back alongside the executed action chunk.
+
+        Callers that drive ``predict_action_chunk`` directly (the async ``PolicyServer``)
+        read this to know how many observations to hand back via ``set_observation_history``.
+        """
+        return self.config.frame_chunk_size * 4
+
+    def set_observation_history(self, batches) -> None:
+        """Supply the keyframes observed while the previous chunk was executing.
+
+        For callers that drive ``predict_action_chunk`` directly instead of ``select_action``
+        and therefore never populate the per-sub-step buffer ``select_action`` maintains.
+        ``batches`` should span the execution of the previous chunk, oldest first, and is
+        resampled to ``observation_history_size`` frames here so callers do not have to hit
+        that count exactly.
+        """
+        if not batches:
+            return
+        frames = [self._extract_raw_obs(b) for b in batches]
+        n = self.observation_history_size
+        if len(frames) > n:
+            # Evenly spaced across the whole span, not the tail: the clip must represent the
+            # entire interval the previous chunk covered, not just its last moments.
+            idx = torch.linspace(0, len(frames) - 1, n).round().long().tolist()
+            frames = [frames[i] for i in idx]
+        elif len(frames) < n:
+            frames = frames + [frames[-1]] * (n - len(frames))
+        self._obs_buffer = frames
+
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs) -> Tensor:
         """Run one autoregressive chunk and return actions ``[B, chunk_size, n_used]`` (normalized)."""
         self.eval()
         self._ensure_frozen_modules()
+        # Reset before the prompt encode so its cost lands in this chunk's profile: it runs
+        # once per episode and would otherwise be invisible despite dominating the first chunk.
+        self._stage_totals = {}
+        chunk_t0 = time.perf_counter()
         self._maybe_init_prompt(batch)
 
         is_first = self._first_chunk
         if is_first:
-            init_latent = self._encode_frames([self._extract_raw_obs(batch)])
+            with self._stage("vae_encode_ms"):
+                init_latent = self._encode_frames([self._extract_raw_obs(batch)])
             self._init_latent = init_latent
             self._init_streaming_cache(init_latent)
             self._obs_buffer = []  # frame 0 (the init obs) conditions the chunk; it is not fed back
@@ -452,12 +521,40 @@ class LingBotVAPolicy(PreTrainedPolicy):
             self._first_chunk = False
         else:
             # Feed the real observed keyframes + the executed actions back into the KV cache.
-            self._compute_kv_cache(self._obs_buffer, self._executed_actions)
+            obs_buffer = self._obs_buffer
+            if not obs_buffer and batch is not None:
+                # Degraded fallback: the caller drove predict_action_chunk() directly without
+                # calling select_action() (which fills the buffer per sub-step) or
+                # set_observation_history() (which the async PolicyServer calls). Leaving the
+                # buffer empty makes _compute_kv_cache() a no-op, so _frame_st_id never advances
+                # and every later chunk is re-predicted from the chunk-0 cache, blind to the
+                # observation stream (see examples/lingbot_va_so101/async_repro_test.py).
+                # Conditioning on the current frame repeated is wrong about the intra-chunk
+                # motion, but at least anchors the chunk to where the robot actually is.
+                logging.warning(
+                    "LingBotVA: no observed keyframes for the KV cache; falling back to the "
+                    "current frame repeated %d times. The chunk will be conditioned on a static "
+                    "clip. Call set_observation_history() with the frames observed while the "
+                    "previous chunk executed.",
+                    self.observation_history_size,
+                )
+                obs_buffer = [self._extract_raw_obs(batch)] * self.observation_history_size
+            self._compute_kv_cache(obs_buffer, self._executed_actions)
             self._obs_buffer = []
             actions, latents = self._infer(None, frame_st_id=self._frame_st_id)
 
         # actions: [B, action_dim, F, action_per_frame, 1] (model-normalized). Keep for KV feedback.
         self._executed_actions = actions
+
+        if self._profiling:
+            total = (time.perf_counter() - chunk_t0) * 1000
+            profile = dict(self._stage_totals)
+            profile["chunk_total_ms"] = total
+            # Whatever the named stages did not account for (scheduler steps, CFG algebra,
+            # tensor reshapes, the action-channel mask).
+            profile["other_ms"] = max(0.0, total - sum(self._stage_totals.values()))
+            profile["first_chunk"] = float(is_first)
+            self.last_latency_profile = profile
 
         if self.config.save_predicted_video:
             # Match upstream LingBot-VA visualization: collect chunk latents and decode the
@@ -482,7 +579,8 @@ class LingBotVAPolicy(PreTrainedPolicy):
         task = batch.get("task")
         prompt = task[0] if isinstance(task, list | tuple) else task
         self._prompt = prompt or ""
-        self._prompt_embeds, self._negative_prompt_embeds = self._encode_prompt(self._prompt)
+        with self._stage("text_encode_ms"):
+            self._prompt_embeds, self._negative_prompt_embeds = self._encode_prompt(self._prompt)
 
     def _get_t5_prompt_embeds(self, prompt, max_sequence_length):
         tokenizer = self._frozen["tokenizer"]
@@ -720,7 +818,8 @@ class LingBotVAPolicy(PreTrainedPolicy):
             return
         self.transformer.clear_pred_cache("pos")
         # Encode the buffered keyframe clip in one streaming call (carries the causal VAE cache).
-        latent_model_input = self._encode_frames(obs_buffer)
+        with self._stage("vae_encode_ms"):
+            latent_model_input = self._encode_frames(obs_buffer)
         # On the first feedback, prepend the init latent so the latent/action frame counts align
         # (upstream prepends ``init_latent`` to the observed keyframes when frame_st_id == 0).
         if self._frame_st_id == 0 and getattr(self, "_init_latent", None) is not None:
@@ -730,7 +829,7 @@ class LingBotVAPolicy(PreTrainedPolicy):
         input_dict = self._prepare_latent_input(
             latent_model_input, action_model_input, frame_st_id=self._frame_st_id
         )
-        with torch.no_grad():
+        with torch.no_grad(), self._stage("kv_cache_ms"):
             self.transformer(
                 self._repeat_input_for_cfg(input_dict["latent_res_lst"]),
                 update_cache=2,
@@ -776,12 +875,13 @@ class LingBotVAPolicy(PreTrainedPolicy):
             input_dict = self._prepare_latent_input(
                 latents, None, t, t, latent_cond, None, frame_st_id=frame_st_id
             )
-            video_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict["latent_res_lst"]),
-                update_cache=1 if last_step else 0,
-                cache_name="pos",
-                action_mode=False,
-            )
+            with self._stage("video_denoise_ms"):
+                video_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict["latent_res_lst"]),
+                    update_cache=1 if last_step else 0,
+                    cache_name="pos",
+                    action_mode=False,
+                )
             if not last_step or cfg.video_exec_step != -1:
                 video_noise_pred = data_seq_to_patch(
                     cfg.patch_size,
@@ -812,12 +912,13 @@ class LingBotVAPolicy(PreTrainedPolicy):
             input_dict = self._prepare_latent_input(
                 None, actions, t, t, None, action_cond, frame_st_id=frame_st_id
             )
-            action_noise_pred = self.transformer(
-                self._repeat_input_for_cfg(input_dict["action_res_lst"]),
-                update_cache=1 if last_step else 0,
-                cache_name="pos",
-                action_mode=True,
-            )
+            with self._stage("action_denoise_ms"):
+                action_noise_pred = self.transformer(
+                    self._repeat_input_for_cfg(input_dict["action_res_lst"]),
+                    update_cache=1 if last_step else 0,
+                    cache_name="pos",
+                    action_mode=True,
+                )
             if not last_step:
                 action_noise_pred = rearrange(action_noise_pred, "b (f n) c -> b c f n 1", f=frame_chunk_size)
                 if cfg.action_guidance_scale > 1:

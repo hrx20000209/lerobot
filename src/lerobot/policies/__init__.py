@@ -21,6 +21,7 @@ from .evo1.configuration_evo1 import Evo1Config as Evo1Config
 from .factory import get_policy_class, make_policy, make_policy_config, make_pre_post_processors
 from .fastwam.configuration_fastwam import FastWAMConfig as FastWAMConfig
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
+from .giga_world.configuration_giga_world import GigaWorldConfig as GigaWorldConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
@@ -49,6 +50,7 @@ __all__ = [
     "FastWAMConfig",
     "GaussianActorConfig",
     "Evo1Config",
+    "GigaWorldConfig",
     "GrootConfig",
     "LingBotVAConfig",
     "MolmoAct2Config",

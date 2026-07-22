@@ -50,7 +50,7 @@ from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
-from .constants import SUPPORTED_POLICIES, normalize_policy_type
+from .constants import MAX_OBSERVATION_HISTORY, SUPPORTED_POLICIES, normalize_policy_type
 from .helpers import (
     FPSTracker,
     LatencyRecorder,
@@ -90,6 +90,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._predicted_timesteps_lock = threading.Lock()
         self._predicted_timesteps = set()
 
+        # Every observation seen since the last prediction. Autoregressive world-model
+        # policies (LingBot-VA) need the frames observed *while the previous chunk was
+        # executing* to advance their KV cache; the single latest observation
+        # `observation_queue` keeps is not enough. See _push_observation_history.
+        self._observation_history_lock = threading.Lock()
+        self._observation_history: list[TimedObservation] = []
+
         self.last_processed_obs = None
 
         # Attributes will be set by SendPolicyInstructions
@@ -122,6 +129,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
+
+        with self._observation_history_lock:
+            self._observation_history = []
 
     def Ready(self, request, context):  # noqa: N802
         client_id = context.peer()
@@ -285,6 +295,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
+        # Recorded before the queue's de-duplication: policies that consume the observation
+        # stream need every frame, including ones too similar to be worth re-predicting on.
+        self._record_observation_history(timed_observation)
+
         enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
         )
@@ -410,6 +424,62 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
             return services_pb2.Empty()
 
+    def _observation_history_size(self) -> int:
+        """How many observed keyframes the policy wants per chunk (0 if it does not use them)."""
+        if self.policy is None:
+            return 0
+        return int(getattr(self.policy, "observation_history_size", 0) or 0)
+
+    def _record_observation_history(self, obs: TimedObservation) -> None:
+        """Buffer an observation for the next chunk's history feedback.
+
+        Bounded so a client that stops requesting actions cannot grow this without limit; the
+        cap is generous because the useful span is "everything since the last prediction",
+        which at a high client FPS and a slow policy can be a few hundred frames.
+        """
+        if self._observation_history_size() <= 0:
+            return
+        with self._observation_history_lock:
+            self._observation_history.append(obs)
+            if len(self._observation_history) > MAX_OBSERVATION_HISTORY:
+                del self._observation_history[:-MAX_OBSERVATION_HISTORY]
+
+    def _push_observation_history(self) -> None:
+        """Hand the policy the frames observed while the previous chunk was executing.
+
+        Autoregressive policies advance a KV cache with the real observations that followed
+        the actions they last emitted. Without this they only ever see the single conditioning
+        frame of the first chunk. The history is trimmed to the policy's requested count
+        *before* preprocessing so a fast client does not cost hundreds of resizes per replan.
+
+        The **first** n observations are used, not an even spread over everything received.
+        The client executes the previous chunk's actions back-to-back at its control rate as
+        soon as the chunk lands, so those first n frames are the execution window. Anything
+        after them is the robot idling because inference has not finished yet -- feeding that
+        in would tell the world model the motion stalled. When the client's rate is matched to
+        the chunk duration (the intended configuration) the two are the same thing.
+        """
+        n = self._observation_history_size()
+        if n <= 0:
+            return
+        with self._observation_history_lock:
+            history, self._observation_history = self._observation_history, []
+        if not history:
+            return
+        history = history[:n]
+        batches = [
+            self.preprocessor(
+                raw_observation_to_observation(
+                    timed_obs.get_observation(),
+                    self.lerobot_features,
+                    self.policy_image_features,
+                )
+            )
+            for timed_obs in history
+        ]
+        self.policy.set_observation_history(batches)
+        self.logger.debug(f"Pushed {len(batches)} observed keyframes into the policy's KV feedback")
+
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
         """Check if the observation is valid to be processed by the policy"""
         with self._predicted_timesteps_lock:
@@ -533,6 +603,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
+        # Must happen after the preprocessor is warm and before inference: the policy consumes
+        # the pushed keyframes inside predict_action_chunk.
+        self._push_observation_history()
         self._sync_policy_device()
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
