@@ -19,6 +19,7 @@ import torch
 
 from common import RUNS_ROOT, action_quantiles, attach_text_embed_cache, build_config, make_dataset, make_ds_meta, normalize_action
 from lerobot.policies.factory import make_policy
+from selfcond import SelfCondConfig, training_loss_selfcond
 
 try:
     import wandb
@@ -74,9 +75,36 @@ def main():
         "base-model copy alongside training would not fit one 24GB GPU. Required unless "
         "--eval_every > --num_steps (i.e. eval never runs).",
     )
+    p.add_argument(
+        "--selfcond-p-max", type=float, default=0.0,
+        help="Max probability (after ramp) of replacing a chunk's action-history "
+        "conditioning with the model's own no-grad x0 self-prediction. 0 (default) "
+        "reproduces the original training path exactly -- see selfcond.py's docstring "
+        "for why that's guaranteed bit-identical, not just 'should be similar'.",
+    )
+    p.add_argument("--selfcond-ramp-frac", type=float, default=0.4)
+    p.add_argument("--selfcond-x0-t", type=float, default=0.5)
+    p.add_argument("--keep-recent-clean-prob", type=float, default=0.5)
+    p.add_argument(
+        "--action-history-noise", action="store_true",
+        help="Ablation arm, mutually exclusive with --selfcond-p-max: perturb action "
+        "history with structured noise instead of a learned self-prediction.",
+    )
+    p.add_argument("--action-history-noise-prob", type=float, default=0.4)
     args = p.parse_args()
     if args.eval_gpu is None and args.eval_every <= args.num_steps:
         p.error("--eval_gpu is required whenever eval will run (see --help for why)")
+    if args.action_history_noise and args.selfcond_p_max > 0:
+        p.error("--action-history-noise and --selfcond-p-max are mutually exclusive")
+    selfcond_cfg = SelfCondConfig(
+        p_max=args.selfcond_p_max,
+        ramp_frac=args.selfcond_ramp_frac,
+        x0_t=args.selfcond_x0_t,
+        keep_recent_clean_prob=args.keep_recent_clean_prob,
+        action_history_noise=args.action_history_noise,
+        action_history_noise_prob=args.action_history_noise_prob,
+    )
+    selfcond_active = args.selfcond_p_max > 0 or args.action_history_noise
 
     run_dir = RUNS_ROOT / args.run_id
     (run_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -127,17 +155,24 @@ def main():
     csv_path = run_dir / "train_log.csv"
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["step", "latent_loss", "action_loss", "total_loss", "lr", "grad_norm", "step_time_s"])
+    csv_writer.writerow(
+        ["step", "latent_loss", "action_loss", "total_loss", "lr", "grad_norm", "step_time_s",
+         "selfcond_p", "selfcond_replace_rate", "selfcond_a0_gt_l2"]
+    )
 
     data_iter = cycle(loader)
     recent_losses = deque(maxlen=args.early_stop_window)
+    recent_a0_l2_ratios = deque(maxlen=5)  # last 5 logged points = last ~500 steps
     for step in range(1, args.num_steps + 1):
         t0 = time.time()
         batch = next(data_iter)
         batch = {k: (v.to(config.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         batch["action"] = normalize_action(batch["action"], q01, q99)
 
-        loss, metrics = policy.forward(batch)
+        if selfcond_active:
+            loss, metrics = training_loss_selfcond(policy, batch, step, args.num_steps, selfcond_cfg)
+        else:
+            loss, metrics = policy.forward(batch)
         optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip_norm)
@@ -147,7 +182,11 @@ def main():
         lr = optimizer.param_groups[0]["lr"]
         step_time = time.time() - t0
 
-        row = [step, metrics["latent_loss"], metrics["action_loss"], loss.item(), lr, grad_norm.item(), step_time]
+        row = [
+            step, metrics["latent_loss"], metrics["action_loss"], loss.item(), lr, grad_norm.item(), step_time,
+            metrics.get("selfcond_p", 0.0), metrics.get("selfcond_replace_rate", 0.0),
+            metrics.get("selfcond_a0_gt_l2"),
+        ]
         csv_writer.writerow(row)
         csv_file.flush()
         recent_losses.append(loss.item())
@@ -171,6 +210,26 @@ def main():
                     },
                     step=step,
                 )
+
+        if selfcond_active and step % 100 == 0:
+            l2 = metrics.get("selfcond_a0_gt_l2")
+            print(
+                f"[step {step}] selfcond: p={metrics.get('selfcond_p', 0.0):.3f} "
+                f"replace_rate={metrics.get('selfcond_replace_rate', 0.0):.3f} "
+                f"a0_vs_gt_l2={l2 if l2 is None else f'{l2:.3f}'}",
+                flush=True,
+            )
+            gt_step_diff = metrics.get("selfcond_gt_step_diff")
+            if l2 is not None and gt_step_diff:
+                recent_a0_l2_ratios.append(l2 / gt_step_diff)
+                if len(recent_a0_l2_ratios) == recent_a0_l2_ratios.maxlen and min(recent_a0_l2_ratios) > 2.0:
+                    print(
+                        f"[step {step}] WARNING: self-cond a0 predictions have stayed >2x the "
+                        f"GT step-to-step action difference for the last {recent_a0_l2_ratios.maxlen} "
+                        f"logged points (ratios={[f'{r:.2f}' for r in recent_a0_l2_ratios]}) -- Pass 1 "
+                        f"quality looks poor; consider a longer --selfcond-ramp-frac.",
+                        flush=True,
+                    )
 
         if step % args.save_every == 0 or step == args.num_steps:
             ckpt_dir = run_dir / "checkpoints" / f"step_{step}"
