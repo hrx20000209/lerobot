@@ -91,6 +91,11 @@ class LingBotVAConfig(PreTrainedConfig):
     # Subset of the 30-d action space used by the benchmark (LIBERO = 7-DoF). The action
     # (un)normalization quantiles live in the checkpoint's ``policy_postprocessor.json``, not here.
     used_action_channel_ids: list[int] = field(default_factory=lambda: list(range(7)))
+    # Optional per-used-channel weights for the action flow-matching loss (same length/order as
+    # ``used_action_channel_ids``). ``None`` -> all-ones (unchanged behaviour). Used to up-weight
+    # e.g. the gripper channel, which is otherwise swamped by the arm channels in the equal-weight
+    # masked MSE. The loss is a weighted mean (normalized by the sum of weights).
+    used_action_channel_weights: list[float] | None = None
 
     # Opt-in: VAE-decode predicted video latents to ``self.last_predicted_frames`` for saving MP4s.
     save_predicted_video: bool = False

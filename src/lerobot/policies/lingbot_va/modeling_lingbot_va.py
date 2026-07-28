@@ -309,12 +309,17 @@ class LingBotVAPolicy(PreTrainedPolicy):
         latent_loss = (latent_loss.sum(dim=1) / (torch.ones_like(latent_loss).sum(dim=1) + 1e-6)).mean()
 
         amask = ad["actions_mask"].float()
-        action_loss = F.mse_loss(action_pred.float(), ad["targets"].float().detach(), reduction="none")
+        # Loss weighting mask: weighted per-channel if configured, else the binary action mask.
+        lossw = ad.get("actions_loss_weight", amask).float()
+        raw_err = F.mse_loss(action_pred.float(), ad["targets"].float().detach(), reduction="none")
+        # Per-channel (unweighted) action loss for logging: mean over B, F, apf, 1 -> [action_dim].
+        with torch.no_grad():
+            self._last_per_ch_action_loss = raw_err.mean(dim=(0, 2, 3, 4)).detach().float().cpu()
         action_loss = (
-            (action_loss * aw[:, None, :, None, None] * amask).permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
+            (raw_err * aw[:, None, :, None, None] * lossw).permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
         )
-        amask_f = amask.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
-        action_loss = (action_loss.sum(dim=1) / (amask_f.sum(dim=1) + 1e-6)).mean()
+        lossw_f = lossw.permute(0, 2, 3, 4, 1).flatten(0, 1).flatten(1)
+        action_loss = (action_loss.sum(dim=1) / (lossw_f.sum(dim=1) + 1e-6)).mean()
         return latent_loss, action_loss
 
     def training_loss_from_streams(self, latents, actions, actions_mask, text_emb):
@@ -339,6 +344,14 @@ class LingBotVAPolicy(PreTrainedPolicy):
         latent_dict["text_emb"] = text_emb
         action_dict["text_emb"] = text_emb
         action_dict["actions_mask"] = actions_mask
+        # Optional per-channel loss weighting (weighted mean). Kept SEPARATE from actions_mask,
+        # which also zeroes unused channels during noising and must stay binary.
+        cw = self.config.used_action_channel_weights
+        if cw is not None:
+            wt = torch.ones(self.config.action_dim, device=actions.device, dtype=actions.dtype)
+            idx = torch.as_tensor(self.config.used_action_channel_ids, device=actions.device)
+            wt[idx] = torch.as_tensor(cw, device=actions.device, dtype=actions.dtype)
+            action_dict["actions_loss_weight"] = (actions_mask > 0).to(actions.dtype) * wt.view(1, -1, 1, 1, 1)
         input_dict = {
             "latent_dict": latent_dict,
             "action_dict": action_dict,
