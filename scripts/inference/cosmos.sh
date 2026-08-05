@@ -142,9 +142,9 @@ cmd_server() {
   export DRY_RUN=false PROFILE_STAGES=true TRUNCATE_VAE_ENCODE="${TRUNCATE}" RUN_TAG
   export TRACE_PATH="${LOG_ROOT}/${RUN_TAG}_server_stage_trace.jsonl"
   if [[ "${1:-}" == "--fg" ]]; then
-    exec "${SCRIPTS}/run_cosmos13k_shadow_server_thor.sh"
+    exec "${SCRIPTS}/run_cosmos20k_server_thor.sh"
   fi
-  nohup "${SCRIPTS}/run_cosmos13k_shadow_server_thor.sh" > "${SERVER_OUT}" 2>&1 &
+  nohup "${SCRIPTS}/run_cosmos20k_server_thor.sh" > "${SERVER_OUT}" 2>&1 &
   echo "server starting -> ${SERVER_OUT}"
 }
 
@@ -165,7 +165,7 @@ _client() {  # $1 = shadow|real, $2 = seconds
   _banner
   SHADOW=$([[ "$1" == "shadow" ]] && echo true || echo false) \
   RUN_SECONDS="${2:-60}" RUN_TAG="${RUN_TAG}" BASE_DIR="${LOG_ROOT}" \
-    "${SCRIPTS}/run_cosmos13k_profiled_thor.sh"
+    "${SCRIPTS}/run_cosmos20k_client_thor.sh"
 }
 
 cmd_analyze() {
