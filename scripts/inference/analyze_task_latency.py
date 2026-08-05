@@ -128,10 +128,15 @@ def main():
     while k + 1 < len(t) and abs(grip[k + 1] - hold) >= abs(grip[k] - hold):
         k += 1
     peak_i = k
-    print(f"（抓取时夹爪被方块卡定在 {hold:.2f}）")
 
     t_grasp, t_release, t_peak = rel[grasp_i], rel[release_i], rel[peak_i]
-    srv = [r for r in srv_all if t_first_obs <= r["server_recv_time"] <= t[peak_i]]
+    # Count by when the server *started* a chunk, and bound the window by the
+    # reported end-to-end figure (the release) rather than the excursion peak,
+    # so the count and the percentages share one denominator.
+    srv = [r for r in srv_all if t_first_obs <= r["server_recv_time"] <= t[release_i]]
+    busy_s = sum(r["total_server_ms"] for r in srv) / 1000
+    serve_lo = min(r["server_recv_time"] for r in srv) - t_first_obs
+    serve_hi = max(r["server_reply_time"] for r in srv) - t_first_obs
 
     print(f"首次 perception        t = 0.00 s   (wall {t_first_obs:.3f})")
     print(f"首个动作落地           t = {rel[0]:6.2f} s")
@@ -146,9 +151,13 @@ def main():
     print(f"  接近 + 抓取             {t_grasp - rel[0]:6.2f} s   ({100 * (t_grasp - rel[0]) / t_release:4.1f}%)")
     print(f"  搬运 → 松开             {t_release - t_grasp:6.2f} s   ({100 * (t_release - t_grasp) / t_release:4.1f}%)")
     print(f"\nWAM 推理次数（窗口内）  {len(srv)}")
-    print(f"  平均每次推理           {np.median([r['total_server_ms'] for r in srv]):.1f} ms")
-    print(f"  推理总耗时             {sum(r['total_server_ms'] for r in srv) / 1000:.1f} s "
-          f"({100 * sum(r['total_server_ms'] for r in srv) / 1000 / t_release:.0f}% 的墙钟时间)")
+    print(f"  单次耗时               中位 {np.median([r['total_server_ms'] for r in srv]):.0f} / "
+          f"均值 {np.mean([r['total_server_ms'] for r in srv]):.0f} / 最大 {max(r['total_server_ms'] for r in srv):.0f} ms")
+    print(f"  推理累计               {busy_s:.1f} s")
+    # Against the period the server was actually in service -- dividing by the
+    # whole window would credit it for time before the first observation landed.
+    print(f"  服务端忙碌率           {100 * busy_s / (serve_hi - serve_lo):.0f}%  "
+          f"(服务期 {serve_lo:.2f}–{serve_hi:.2f} s)")
     print(f"  执行动作数             {int((rel <= t_release).sum())}")
 
     # ---------------- figure 1: actions ----------------
@@ -212,13 +221,12 @@ def main():
     ax.set_title(f"(b) 单次推理阶段预算　{tot:.0f} ms × {len(srv)} 次")
 
     ax = axes[2]
-    infer_total = sum(r["total_server_ms"] for r in srv) / 1000
-    ax.bar(["墙钟时间", "推理累计"], [t_release, infer_total],
+    ax.bar(["墙钟时间", "推理累计"], [t_release, busy_s],
            color=["tab:gray", "tab:red"])
-    for i, v in enumerate([t_release, infer_total]):
+    for i, v in enumerate([t_release, busy_s]):
         ax.text(i, v + 0.6, f"{v:.1f}s", ha="center", fontsize=11, fontweight="bold")
     ax.set_ylabel("秒")
-    ax.set_title(f"(c) 推理占任务时长的 {100 * infer_total / t_release:.0f}%")
+    ax.set_title(f"(c) 服务端忙碌率 {100 * busy_s / (serve_hi - serve_lo):.0f}%")
     for a in axes:
         a.grid(alpha=0.3, axis="x" if a is not axes[2] else "y")
     fig.tight_layout(); fig.savefig(out / "task_latency_breakdown.png", dpi=140, bbox_inches="tight"); plt.close(fig)
@@ -230,7 +238,8 @@ def main():
         "end_to_end_s": float(t_release),
         "n_inferences": len(srv),
         "median_inference_ms": float(np.median([r["total_server_ms"] for r in srv])),
-        "inference_total_s": float(infer_total),
+        "inference_total_s": float(busy_s),
+        "server_busy_fraction": float(busy_s / (serve_hi - serve_lo)),
         "n_actions": int((rel <= t_release).sum()),
     }, indent=2, ensure_ascii=False))
     print(f"\n-> {out}")
