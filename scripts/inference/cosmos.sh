@@ -101,19 +101,34 @@ for i, n in names:
 if dead:
     print("arm    : MOTORS NOT RESPONDING ->", ", ".join(f"id{i} {n}" for i, n in dead))
     print("         这通常是过载保护锁存，需要给舵机断电重启一次。")
-else:
+    raise SystemExit(0)
+
+# Position needs the calibration to denormalise; temperature and load are raw
+# registers and read fine without it. Report whatever is available rather than
+# failing the whole status on a missing calibration.
+for label, reg, rnd in (("temp   ", "Present_Temperature", False),
+                        ("load   ", "Present_Load", False)):
     try:
-        pos = bus.sync_read("Present_Position")
-        temp = bus.sync_read("Present_Temperature")
-        load = bus.sync_read("Present_Load")
-        print("arm    :", {k: round(v, 1) for k, v in pos.items()})
-        print("temp   :", temp)
-        hot = [k for k, v in temp.items() if v >= 55]
-        if hot:
-            print("         偏热:", ", ".join(hot), "(今天 shoulder_lift 在 60C 跳过闸)")
-        print("load   :", load)
+        print(label + ":", bus.sync_read(reg))
     except Exception as exc:
-        print("arm    : <read failed>", exc)
+        print(label + ": <unavailable>", type(exc).__name__)
+try:
+    temp = bus.sync_read("Present_Temperature")
+    hot = [k for k, v in temp.items() if v >= 55]
+    if hot:
+        print("         偏热:", ", ".join(hot), "(今天 shoulder_lift 在 60C 跳过闸)")
+except Exception:
+    pass
+try:
+    from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
+    bus.disconnect()
+    r = SOFollower(SOFollowerRobotConfig(port="${ROBOT_PORT}", id="follower_arm", cameras={},
+                                         use_degrees=True, disable_torque_on_disconnect=False))
+    r.connect()
+    print("arm    :", {k: round(v, 1) for k, v in r.bus.sync_read("Present_Position").items()})
+    r.disconnect()
+except Exception as exc:
+    print("arm    : <position unavailable>", type(exc).__name__)
 EOF
 }
 

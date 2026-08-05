@@ -151,6 +151,8 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --num_denoising_steps_action="${NUM_DENOISING_STEPS}" \
   --actions_per_chunk="${ACTIONS_PER_CHUNK}" \
   --truncate_vae_encode="${TRUNCATE_VAE_ENCODE}" \
+  --generate_future_state="${GENERATE_FUTURE_STATE:-false}" \
+  --future_state_dir="${FUTURE_STATE_DIR:-${LOG_DIR}/${RUN_TAG}_future_state}" \
   --max_delta_from_observation="${MAX_DELTA_FROM_OBS}" \
   --max_gripper_delta_from_observation="${MAX_GRIPPER_DELTA_FROM_OBS}" \
   --max_step_delta="${MAX_STEP_DELTA}" \
