@@ -19,10 +19,8 @@ set -euo pipefail
 #   FPS=8                   Inference is ~520 ms for a 16-action chunk, so a
 #                           chunk spans 2 s at 8 fps and the queue never starves.
 #                           30 fps starved it half the time. MUST match the client.
-#   clamps 8 / 4 deg        Left ON. With them off, the policy commands motion
-#                           the servos cannot deliver, the position error never
-#                           closes, and the gripper latched its overload
-#                           protection. They also cut tracking error ~46%.
+#   clamps OFF              The generated action reaches the motors unmodified.
+#                           See the MAX_* block below for what that trades away.
 
 COSMOS_REPO="${COSMOS_REPO:-/home/hrx/Projects/cosmos-policy}"
 LEROBOT_SRC="${LEROBOT_SRC:-/home/hrx/Projects/lerobot/src}"
@@ -60,10 +58,26 @@ PROFILE_STAGES="${PROFILE_STAGES:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 
 # Safety clamps in physical units (degrees; gripper 0-100). 0 disables.
-MAX_DELTA_FROM_OBS="${MAX_DELTA_FROM_OBS:-8}"
-MAX_GRIPPER_DELTA_FROM_OBS="${MAX_GRIPPER_DELTA_FROM_OBS:-8}"
-MAX_STEP_DELTA="${MAX_STEP_DELTA:-4}"
-MAX_GRIPPER_STEP_DELTA="${MAX_GRIPPER_STEP_DELTA:-5}"
+#
+# DISABLED BY DEFAULT: the generated action is executed as-is.
+#
+# What that costs, measured 2026-08-05, so the trade is on the record:
+#   - With clamps on, the gripper locked closed on the cube and never released;
+#     with them off, it kept cycling open/closed and did release. The clamps do
+#     not block the release directly (the policy never commands one while
+#     locked) -- they change the whole closed-loop trajectory, and the policy
+#     ends up in a different basin.
+#   - Clamps on also cut shoulder_lift tracking error ~46%.
+#   - Each configuration overloaded a different servo: clamps off drove
+#     shoulder_lift to 60 C, clamps on had the gripper stall on the cube until
+#     its current protection latched.
+#
+# Restore the conservative values with:
+#   MAX_DELTA_FROM_OBS=8 MAX_GRIPPER_DELTA_FROM_OBS=8 MAX_STEP_DELTA=4 MAX_GRIPPER_STEP_DELTA=5
+MAX_DELTA_FROM_OBS="${MAX_DELTA_FROM_OBS:-0}"
+MAX_GRIPPER_DELTA_FROM_OBS="${MAX_GRIPPER_DELTA_FROM_OBS:-0}"
+MAX_STEP_DELTA="${MAX_STEP_DELTA:-0}"
+MAX_GRIPPER_STEP_DELTA="${MAX_GRIPPER_STEP_DELTA:-0}"
 
 # Camera -> Cosmos slot mapping. Must match the client's camera names.
 PRIMARY_CAMERA_KEY="${PRIMARY_CAMERA_KEY:-front}"
@@ -114,9 +128,10 @@ echo " Cosmos step-20000 policy server"
 echo "   ckpt        : ${CKPT_PATH}"
 echo "   denoise     : ${NUM_DENOISING_STEPS}   chunk: ${ACTIONS_PER_CHUNK}   fps: ${FPS}"
 echo "   truncate VAE: ${TRUNCATE_VAE_ENCODE}"
-echo "   clamps      : obs=${MAX_DELTA_FROM_OBS} step=${MAX_STEP_DELTA} (0 = disabled)"
-if [[ "${MAX_DELTA_FROM_OBS}" == "0" && "${MAX_STEP_DELTA}" == "0" ]]; then
-  echo "   >> CLAMPS DISABLED: raw model actions go straight to the client."
+echo "   clamps      : obs=${MAX_DELTA_FROM_OBS} step=${MAX_STEP_DELTA} grip=${MAX_GRIPPER_DELTA_FROM_OBS}/${MAX_GRIPPER_STEP_DELTA} (0 = disabled)"
+if [[ "${MAX_DELTA_FROM_OBS}" == "0" && "${MAX_STEP_DELTA}" == "0" \
+   && "${MAX_GRIPPER_DELTA_FROM_OBS}" == "0" && "${MAX_GRIPPER_STEP_DELTA}" == "0" ]]; then
+  echo "   >> UNBOUNDED: the generated action is executed as-is, no clamping anywhere."
 fi
 [[ "${DRY_RUN}" == "true" ]] && echo "   >> DRY RUN: returning measured pose, not model actions."
 echo "   log         : ${SERVER_LOG}"

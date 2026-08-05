@@ -16,14 +16,14 @@
 #   CKPT_ROOT   checkpoint dir            (default: step20000)
 #   FPS         control rate              (default: 8)   server and client must match
 #   TRUNCATE    truncated VAE encode      (default: true)
-#   CLAMPS      safety clamps on/off      (default: on)
+#   CLAMPS      safety clamps on/off      (default: OFF -- action executed as-is)
 #   RUN_TAG     names the run's artifacts (default: timestamp)
 #
 # Examples
 #   cosmos.sh go 180
 #   CKPT_ROOT=~/Projects/models/three_cubes_1/cosmos_policy_step13000 cosmos.sh go 60
 #   TRUNCATE=false RUN_TAG=baseline cosmos.sh go 100
-#   CLAMPS=off cosmos.sh real 30          # no safety clamps -- see the warning it prints
+#   CLAMPS=on  cosmos.sh real 30          # restore the conservative 8/4 deg bounds
 
 set -euo pipefail
 
@@ -37,7 +37,10 @@ export FPS="${FPS:-8}"
 export ROBOT_PORT="${ROBOT_PORT:-/dev/ttyACM0}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 TRUNCATE="${TRUNCATE:-true}"
-CLAMPS="${CLAMPS:-on}"
+# Off by default: the generated action is executed as-is. CLAMPS=on restores
+# the conservative 8/4 deg bounds (see run_cosmos20k_server_thor.sh for what
+# each setting was measured to cost).
+CLAMPS="${CLAMPS:-off}"
 
 LOG_ROOT="${LOG_ROOT:-${CKPT_ROOT}/profiling}"
 SERVER_OUT="${LOG_ROOT}/${RUN_TAG}_server.log"
@@ -58,7 +61,7 @@ _banner() {
   echo " ckpt      : ${CKPT_ROOT##*/}"
   echo " fps       : ${FPS}    truncate_vae: ${TRUNCATE}    clamps: ${CLAMPS}"
   echo " run_tag   : ${RUN_TAG}"
-  [[ "${CLAMPS}" == "off" ]] && echo " !! CLAMPS OFF: raw model actions reach the motors."
+  [[ "${CLAMPS}" == "off" ]] && echo " !! UNBOUNDED: generated action executed as-is, no clamping."
   echo "-----------------------------------------------------------"
 }
 
