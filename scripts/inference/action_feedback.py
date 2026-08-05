@@ -81,6 +81,21 @@ class FeedbackConfig:
     # Degrees of error reduction that counts as "still making progress".
     stall_progress_deg: float = 0.5
 
+    # Spend this many seconds at the start of a run observing instead of acting,
+    # then set the thresholds from what was observed. 0 keeps the fixed values.
+    #
+    # The thresholds above were read off one baseline run by hand, which does not
+    # survive a change of checkpoint, fps, payload or gripper contents -- and
+    # getting them wrong is not benign: a flat 95 fired on 36.9% of elbow_flex's
+    # normal operation and over-constrained the policy into failing the task.
+    # Deriving them from the run itself is the same idea as the guards
+    # themselves: let the measurement set the parameter.
+    autotune_secs: float = 0.0
+    # Stall threshold = observed p99 load x this.
+    autotune_stall_margin: float = 1.15
+    # Lead limit = observed p99 tracking error x this, floored at 5 deg.
+    autotune_lead_margin: float = 1.5
+
 
 @dataclass
 class FeedbackStats:
@@ -118,6 +133,57 @@ class ActionFeedback:
         self._stall_thresh = [
             float(config.stall_load_per_joint.get(j, config.stall_load)) for j in joints
         ]
+        self._tune_t0: float | None = None
+        self._tune_loads: list[list[float]] = []
+        self._tune_errs: list[list[float]] = []
+        self.autotuned: dict | None = None
+
+    @property
+    def tuning(self) -> bool:
+        return self.cfg.autotune_secs > 0 and self.autotuned is None
+
+    def _observe(self, err: np.ndarray, load: np.ndarray | None, now: float) -> None:
+        if self._tune_t0 is None:
+            self._tune_t0 = now
+        if load is not None:
+            self._tune_loads.append([abs(float(v)) for v in load])
+        self._tune_errs.append([float(v) for v in err])
+
+    def _finish_autotune(self) -> None:
+        """Raise the thresholds to fit what this run showed -- never lower them.
+
+        A startup window cannot see loads that only occur later: the gripper's
+        p99 over a full run is ~216, but in the first seconds the arm has not
+        grasped anything yet and it reads a fraction of that. Tuning downward on
+        that evidence would set a threshold the grasp then trips constantly --
+        which is precisely the failure that a flat threshold of 95 produced
+        (36.9% of elbow_flex's normal operation flagged as a stall, 470 spurious
+        freezes, task not completed).
+
+        So the configured values act as a floor: observation can only widen the
+        band. That keeps auto-tuning strictly safer than the priors it starts
+        from, at the cost of not tightening a threshold that was set too loose.
+        """
+        if self._tune_loads:
+            loads = np.asarray(self._tune_loads)
+            p99 = np.percentile(loads, 99, axis=0)
+            self._stall_thresh = [
+                max(self._stall_thresh[i], float(p99[i]) * self.cfg.autotune_stall_margin)
+                for i in range(len(self.joints))
+            ]
+        lead = self.cfg.max_lead_deg
+        if self._tune_errs:
+            errs = np.asarray(self._tune_errs)
+            observed = float(np.percentile(errs, 99)) * self.cfg.autotune_lead_margin
+            lead = max(lead, observed, 5.0)
+            self.cfg.max_lead_deg = lead
+        self.autotuned = {
+            "stall_thresh": {j: round(t, 1) for j, t in zip(self.joints, self._stall_thresh)},
+            "max_lead_deg": round(lead, 2),
+            "samples": len(self._tune_errs),
+        }
+        self._tune_loads.clear()
+        self._tune_errs.clear()
 
     def reset(self) -> None:
         self._prev_cmd = None
@@ -134,6 +200,16 @@ class ActionFeedback:
             return cmd
         out = np.asarray(cmd, dtype=np.float64).copy()
         self.stats.n_commands += 1
+
+        # Observation window: watch, do not act. Passing the command through
+        # unmodified is what makes the sample representative of the unguarded
+        # system -- guarding while measuring would tune against its own effect.
+        if self.tuning:
+            self._observe(np.abs(out - present), load, now)
+            if self._tune_t0 is not None and now - self._tune_t0 >= self.cfg.autotune_secs:
+                self._finish_autotune()
+            self._prev_cmd = out.copy()
+            return out
 
         # --- stall: stop pushing a joint that is saturated and not progressing
         if load is not None:

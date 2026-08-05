@@ -77,6 +77,19 @@ if ! ss -ltn 2>/dev/null | grep -q ":${SERVER_ADDRESS##*:}\b"; then
   exit 3
 fi
 
+# The port being open does not mean *this* run's server is the one serving it.
+# A leftover server from an earlier run answers just as happily, and the fps
+# mismatch that produces is invisible in the client's own logs -- it silently
+# cost one run (client at 30 fps, server stamping at 24). The server writes its
+# stage trace under the same RUN_TAG, so its absence means the server on the
+# port belongs to some other run.
+if [[ ! -e "${BASE_DIR}/${RUN_TAG}_server_stage_trace.jsonl" ]]; then
+  echo "WARNING: no server stage trace for RUN_TAG=${RUN_TAG}." >&2
+  echo "         The server answering on ${SERVER_ADDRESS} is probably from another run;" >&2
+  echo "         its fps must match FPS=${FPS} or the action timestamps will be wrong." >&2
+  echo "         Stop it with: pkill -9 -f so101_async_deploy_three_cubes_k16" >&2
+fi
+
 EXTRA=()
 [[ -n "${MAX_RELATIVE_TARGET}" ]] && EXTRA+=(--robot.max_relative_target="${MAX_RELATIVE_TARGET}")
 
@@ -127,6 +140,7 @@ exec "${PYTHON_BIN}" -u scripts/inference/cosmos_profiled_client.py \
   --fb_max_lead_deg="${FB_MAX_LEAD_DEG:-0}" \
   --fb_stall_load="${FB_STALL_LOAD:-95}" \
   --fb_stall_secs="${FB_STALL_SECS:-1.0}" \
+  --fb_autotune_secs="${FB_AUTOTUNE_SECS:-0}" \
   --record_timeline=true \
   --timeline_log_dir="${TRACE_DIR}" \
   --timeline_save_images=off \

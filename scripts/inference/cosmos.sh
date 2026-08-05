@@ -167,9 +167,16 @@ cmd_server() {
 }
 
 cmd_wait() {
-  echo -n "waiting for server"
+  # Waiting on "is port 8082 open" is not enough: if a previous server is still
+  # running, the port is already open and the check passes instantly -- so the
+  # client then talks to the *old* server. That silently produced a run whose
+  # client was at 30 fps against a server stamping timestamps at 24. Wait for
+  # this run's own stage-trace file, which is named after RUN_TAG, so readiness
+  # is tied to the server we actually launched.
+  local want="${LOG_ROOT}/${RUN_TAG}_server_stage_trace.jsonl"
+  echo -n "waiting for server (${RUN_TAG})"
   for _ in $(seq 1 60); do
-    if _listening; then echo " ready"; return 0; fi
+    if [[ -e "${want}" ]] && _listening; then echo " ready"; return 0; fi
     if [[ -f "${SERVER_OUT}" ]] && grep -qE "Traceback|out of memory|ERROR: port" "${SERVER_OUT}"; then
       echo " FAILED"; tail -20 "${SERVER_OUT}" >&2; return 1
     fi

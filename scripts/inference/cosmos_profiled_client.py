@@ -79,6 +79,10 @@ class ProfiledClientConfig(RobotClientConfig):
     fb_max_lead_deg: float = field(default=0.0, metadata={"help": "Max |command - measured|, deg. 0 = off."})
     fb_stall_load: float = field(default=95.0, metadata={"help": "|load| counting as saturated."})
     fb_stall_secs: float = field(default=1.0, metadata={"help": "Saturated-and-stuck time before freezing a joint."})
+    fb_autotune_secs: float = field(
+        default=0.0,
+        metadata={"help": "Observe (do not act) for this long, then raise the thresholds to fit. 0 = fixed."},
+    )
 
 
 class ProfiledRobotClient(RobotClient):
@@ -138,6 +142,7 @@ class ProfiledRobotClient(RobotClient):
                 max_lead_deg=config.fb_max_lead_deg,
                 stall_load=config.fb_stall_load,
                 stall_secs=config.fb_stall_secs,
+                autotune_secs=config.fb_autotune_secs,
             ),
         )
         self._last_load: np.ndarray | None = None
@@ -411,9 +416,13 @@ class ProfiledRobotClient(RobotClient):
                 s.n_lead_clipped, 100 * s.n_lead_clipped / n, s.max_lead_clip_deg,
                 s.n_stall_frozen, s.stalled_joints or "",
             )
+            if self.feedback.autotuned:
+                self.logger.warning("FEEDBACK autotuned -> %s", self.feedback.autotuned)
             try:
+                payload = s.as_dict()
+                payload["autotuned"] = self.feedback.autotuned
                 (self.trace_dir / "feedback_stats.json").write_text(
-                    json.dumps(s.as_dict(), indent=2, ensure_ascii=False)
+                    json.dumps(payload, indent=2, ensure_ascii=False)
                 )
             except Exception:  # noqa: BLE001
                 pass
