@@ -122,6 +122,11 @@ exec "${PYTHON_BIN}" -u scripts/inference/cosmos_profiled_client.py \
   --trace_dir="${TRACE_DIR}" \
   --screenshot_hz="${SCREENSHOT_HZ}" \
   --actuator_sample_every="${ACTUATOR_SAMPLE_EVERY}" \
+  --feedback="${FEEDBACK:-false}" \
+  --fb_max_step_deg="${FB_MAX_STEP_DEG:-0}" \
+  --fb_max_lead_deg="${FB_MAX_LEAD_DEG:-0}" \
+  --fb_stall_load="${FB_STALL_LOAD:-95}" \
+  --fb_stall_secs="${FB_STALL_SECS:-1.0}" \
   --record_timeline=true \
   --timeline_log_dir="${TRACE_DIR}" \
   --timeline_save_images=off \

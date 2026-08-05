@@ -21,6 +21,7 @@ in shadow is the same code that runs on hardware.
 
 import json
 import logging
+import sys
 import queue
 import threading
 import time
@@ -31,9 +32,14 @@ from typing import Any
 
 import draccus
 
+import numpy as np
+
 from lerobot.async_inference.configs import RobotClientConfig
 from lerobot.async_inference.robot_client import RobotClient
 from lerobot.utils.utils import init_logging
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from action_feedback import ActionFeedback, FeedbackConfig  # noqa: E402
 
 SO101_ACTION_NAMES = [
     "shoulder_pan.pos",
@@ -67,6 +73,12 @@ class ProfiledClientConfig(RobotClientConfig):
             "Each read costs a serial round-trip, so keep it well below the command rate."
         },
     )
+    # --- closed-loop guards (see action_feedback.py) ---
+    feedback: bool = field(default=False, metadata={"help": "Enable the action feedback guards."})
+    fb_max_step_deg: float = field(default=0.0, metadata={"help": "Slew limit per command, deg. 0 = off."})
+    fb_max_lead_deg: float = field(default=0.0, metadata={"help": "Max |command - measured|, deg. 0 = off."})
+    fb_stall_load: float = field(default=95.0, metadata={"help": "|load| counting as saturated."})
+    fb_stall_secs: float = field(default=1.0, metadata={"help": "Saturated-and-stuck time before freezing a joint."})
 
 
 class ProfiledRobotClient(RobotClient):
@@ -117,6 +129,24 @@ class ProfiledRobotClient(RobotClient):
             self.logger.info("Screenshots -> %s at %.1f Hz (background thread)", self.shot_dir, config.screenshot_hz)
 
         self.logger.info("Traces -> %s", base)
+
+        self.feedback = ActionFeedback(
+            SO101_ACTION_NAMES,
+            FeedbackConfig(
+                enabled=config.feedback,
+                max_step_deg=config.fb_max_step_deg,
+                max_lead_deg=config.fb_max_lead_deg,
+                stall_load=config.fb_stall_load,
+                stall_secs=config.fb_stall_secs,
+            ),
+        )
+        self._last_load: np.ndarray | None = None
+        if config.feedback:
+            self.logger.warning(
+                "FEEDBACK ON: slew=%.1f deg  lead=%.1f deg  stall=|load|>=%.0f for %.1fs",
+                config.fb_max_step_deg, config.fb_max_lead_deg,
+                config.fb_stall_load, config.fb_stall_secs,
+            )
 
     # ---------------- write guards ----------------
 
@@ -197,17 +227,20 @@ class ProfiledRobotClient(RobotClient):
         queue_pop_ms = (time.perf_counter() - get_start) * 1000
 
         commanded = self._action_tensor_to_action_dict(timed_action.get_action())
+        policy_commanded = dict(commanded)  # keep the unmodified policy output for the trace
 
         exec_start = time.time()
         send_start = time.perf_counter()
-        if self.shadow:
-            performed = None
-            present = self._read_present_position()
-        else:
-            # send_action itself reads Present_Position when max_relative_target
-            # is set; read it explicitly so the trace has it either way.
-            present = self._read_present_position()
-            performed = self.robot.send_action(commanded)
+        # send_action itself reads Present_Position when max_relative_target is
+        # set; read it explicitly so the trace has it either way -- and because
+        # the feedback guards need the live measurement before the write.
+        present = self._read_present_position()
+        if present and self.feedback.cfg.enabled:
+            cmd_vec = np.array([commanded[j] for j in SO101_ACTION_NAMES], dtype=np.float64)
+            pres_vec = np.array([present[j.removesuffix(".pos")] for j in SO101_ACTION_NAMES], dtype=np.float64)
+            adjusted = self.feedback.apply(cmd_vec, pres_vec, self._last_load, exec_start)
+            commanded = {j: float(v) for j, v in zip(SO101_ACTION_NAMES, adjusted)}
+        performed = None if self.shadow else self.robot.send_action(commanded)
         send_ms = (time.perf_counter() - send_start) * 1000
         exec_end = time.time()
 
@@ -226,6 +259,11 @@ class ProfiledRobotClient(RobotClient):
         every = self.config.actuator_sample_every
         if every and self._n_actions % every == 0:
             actuator = self._read_actuator_state()
+            if actuator and "load" in actuator:
+                self._last_load = np.array(
+                    [abs(actuator["load"].get(j.removesuffix(".pos"), 0)) for j in SO101_ACTION_NAMES],
+                    dtype=np.float64,
+                )
 
         meta = timed_action.get_metadata()
         server_meta = {}
@@ -267,6 +305,9 @@ class ProfiledRobotClient(RobotClient):
             "max_abs_delta": (max(abs(v) for v in deltas.values()) if deltas else None),
             "written_to_motor_bus": not self.shadow,
             "actuator": actuator,
+            # What the policy asked for before the guards, so their effect is
+            # measurable rather than invisible.
+            "policy_commanded_action": policy_commanded,
             "server": server_meta,
         }
         with self._trace_lock:
@@ -360,6 +401,22 @@ class ProfiledRobotClient(RobotClient):
             self._n_shots,
             self.trace_dir,
         )
+        if self.feedback.cfg.enabled:
+            s = self.feedback.stats
+            n = max(s.n_commands, 1)
+            self.logger.warning(
+                "FEEDBACK: slew clipped %d/%d (%.1f%%, worst %.2f deg) | lead clipped %d (%.1f%%, worst %.2f deg) "
+                "| stall freezes %d %s",
+                s.n_slew_clipped, s.n_commands, 100 * s.n_slew_clipped / n, s.max_slew_clip_deg,
+                s.n_lead_clipped, 100 * s.n_lead_clipped / n, s.max_lead_clip_deg,
+                s.n_stall_frozen, s.stalled_joints or "",
+            )
+            try:
+                (self.trace_dir / "feedback_stats.json").write_text(
+                    json.dumps(s.as_dict(), indent=2, ensure_ascii=False)
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
 
 @draccus.wrap()
