@@ -43,9 +43,26 @@ CLIENT_LOG="${CLIENT_LOG:-${TRACE_DIR}/client.log}"
 
 mkdir -p "${TRACE_DIR}"
 
-CAMERAS="{ front: {type: opencv, index_or_path: ${FRONT_CAMERA_INDEX}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${FRONT_FOURCC}\"}, \
-right: {type: opencv, index_or_path: ${RIGHT_CAMERA_INDEX}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${RIGHT_FOURCC}\"}, \
-wrist: {type: opencv, index_or_path: ${WRIST_CAMERA_INDEX}, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"${WRIST_FOURCC}\"} }"
+# View-ablation runs must also stop capturing the camera the server no longer
+# consumes, otherwise the saving is only the VAE half of it.  CAMERA_SET picks
+# which views the client opens; it has to agree with the server's
+# use_wrist_image / num_wrist_images / left_wrist_camera_key.
+#   all         -> front + right + wrist   (server: num_wrist_images=2)
+#   front_wrist -> front + wrist           (server: num_wrist_images=1, left_wrist_camera_key=wrist)
+#   front_right -> front + right           (server: num_wrist_images=1, left_wrist_camera_key=right)
+#   front       -> front only              (server: use_wrist_image=false)
+CAMERA_SET="${CAMERA_SET:-all}"
+_cam() { echo "$1: {type: opencv, index_or_path: $2, width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: \"$3\"}"; }
+_front="$(_cam front "${FRONT_CAMERA_INDEX}" "${FRONT_FOURCC}")"
+_right="$(_cam right "${RIGHT_CAMERA_INDEX}" "${RIGHT_FOURCC}")"
+_wrist="$(_cam wrist "${WRIST_CAMERA_INDEX}" "${WRIST_FOURCC}")"
+case "${CAMERA_SET}" in
+  all)         CAMERAS="{ ${_front}, ${_right}, ${_wrist} }" ;;
+  front_wrist) CAMERAS="{ ${_front}, ${_wrist} }" ;;
+  front_right) CAMERAS="{ ${_front}, ${_right} }" ;;
+  front)       CAMERAS="{ ${_front} }" ;;
+  *) echo "Unknown CAMERA_SET=${CAMERA_SET}" >&2; exit 2 ;;
+esac
 
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 export HF_HOME="${HF_HOME:-/home/hrx/.cache/huggingface}"

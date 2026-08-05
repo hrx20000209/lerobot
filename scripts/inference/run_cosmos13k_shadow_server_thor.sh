@@ -108,5 +108,8 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --max_gripper_step_delta="${MAX_GRIPPER_STEP_DELTA}" \
   --profile_stages="${PROFILE_STAGES}" \
   --trace_path="${TRACE_PATH:-${LOG_DIR}/server_stage_trace_${RUN_TAG}.jsonl}" \
+  --use_wrist_image="${USE_WRIST_IMAGE:-true}" \
+  --num_wrist_images="${NUM_WRIST_IMAGES:-2}" \
+  --left_wrist_camera_key="${LEFT_WRIST_CAMERA_KEY:-right}" \
   --dry_run_zero_actions="${DRY_RUN}" \
   "$@" 2>&1 | tee "${SERVER_LOG}"
