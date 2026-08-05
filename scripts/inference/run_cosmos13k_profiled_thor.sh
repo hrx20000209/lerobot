@@ -36,7 +36,8 @@ SCREENSHOT_HZ="${SCREENSHOT_HZ:-2.0}"
 MAX_RELATIVE_TARGET="${MAX_RELATIVE_TARGET:-}"
 TASK="${TASK:-go to red cube. take the red cube. go to box. put the red cube in box.}"
 
-BASE_DIR="${BASE_DIR:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step13000/profiling}"
+CKPT_ROOT="${CKPT_ROOT:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step20000}"
+BASE_DIR="${BASE_DIR:-${CKPT_ROOT}/profiling}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 TRACE_DIR="${TRACE_DIR:-${BASE_DIR}/${RUN_TAG}}"
 CLIENT_LOG="${CLIENT_LOG:-${TRACE_DIR}/client.log}"
@@ -96,7 +97,7 @@ exec "${PYTHON_BIN}" -u scripts/inference/cosmos_profiled_client.py \
   --robot.cameras="${CAMERAS}" \
   --task="${TASK}" \
   --policy_type=cosmos_policy \
-  --pretrained_name_or_path=/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step13000/model/model \
+  --pretrained_name_or_path="${CKPT_ROOT}" \
   --policy_device=cuda \
   --client_device=cpu \
   --actions_per_chunk="${ACTIONS_PER_CHUNK}" \

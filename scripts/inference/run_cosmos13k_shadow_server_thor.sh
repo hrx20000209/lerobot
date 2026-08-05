@@ -20,9 +20,24 @@ LEROBOT_SRC="${LEROBOT_SRC:-/home/hrx/Projects/lerobot/src}"
 PYTHON_BIN="${PYTHON_BIN:-/home/hrx/miniconda3/envs/cosmos/bin/python}"
 
 # The Cosmos experiment package: holds configs/, processed_data/ (stats + T5).
+# Shared across checkpoints of the same training run.
 TASK_ROOT="${TASK_ROOT:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy}"
-CKPT_PATH="${CKPT_PATH:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step13000/model/model}"
 DATASET_ROOT="${DATASET_ROOT:-/home/hrx/Datasets/three_cubes_1}"
+
+# Checkpoint directory.  Layout differs between exports: step13000 nests the
+# DCP shards under model/model, step20000 puts them directly in model/, so
+# locate the directory that actually holds them rather than hardcoding either.
+CKPT_ROOT="${CKPT_ROOT:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step20000}"
+if [[ -z "${CKPT_PATH:-}" ]]; then
+  if compgen -G "${CKPT_ROOT}/model/model/*.distcp" > /dev/null; then
+    CKPT_PATH="${CKPT_ROOT}/model/model"
+  elif compgen -G "${CKPT_ROOT}/model/*.distcp" > /dev/null; then
+    CKPT_PATH="${CKPT_ROOT}/model"
+  else
+    echo "ERROR: no .distcp shards under ${CKPT_ROOT}/model[/model]" >&2
+    exit 2
+  fi
+fi
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8082}"
@@ -46,7 +61,7 @@ MAX_DELTA_FROM_OBS="${MAX_DELTA_FROM_OBS:-0}"
 MAX_GRIPPER_DELTA_FROM_OBS="${MAX_GRIPPER_DELTA_FROM_OBS:-0}"
 MAX_STEP_DELTA="${MAX_STEP_DELTA:-0}"
 MAX_GRIPPER_STEP_DELTA="${MAX_GRIPPER_STEP_DELTA:-0}"
-LOG_DIR="${LOG_DIR:-/home/hrx/Projects/models/three_cubes_1/cosmos_policy_step13000/shadow_logs}"
+LOG_DIR="${LOG_DIR:-${CKPT_ROOT}/shadow_logs}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 
 for p in "${CKPT_PATH}" "${TASK_ROOT}/processed_data/dataset_statistics.json" \
@@ -107,6 +122,7 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --max_step_delta="${MAX_STEP_DELTA}" \
   --max_gripper_step_delta="${MAX_GRIPPER_STEP_DELTA}" \
   --profile_stages="${PROFILE_STAGES}" \
+  --truncate_vae_encode="${TRUNCATE_VAE_ENCODE:-false}" \
   --trace_path="${TRACE_PATH:-${LOG_DIR}/server_stage_trace_${RUN_TAG}.jsonl}" \
   --use_wrist_image="${USE_WRIST_IMAGE:-true}" \
   --num_wrist_images="${NUM_WRIST_IMAGES:-2}" \
