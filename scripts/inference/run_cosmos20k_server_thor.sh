@@ -151,6 +151,10 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --num_denoising_steps_action="${NUM_DENOISING_STEPS}" \
   --actions_per_chunk="${ACTIONS_PER_CHUNK}" \
   --action_gain="${ACTION_GAIN:-1.0}" \
+  --skip_if_static="${SKIP_IF_STATIC:-false}" \
+  --skip_proprio_deg="${SKIP_PROPRIO_DEG:-1.0}" \
+  --skip_image_diff="${SKIP_IMAGE_DIFF:-2.0}" \
+  --skip_max_consecutive="${SKIP_MAX_CONSECUTIVE:-8}" \
   --action_stride="${ACTION_STRIDE:-1}" \
   --truncate_vae_encode="${TRUNCATE_VAE_ENCODE}" \
   --generate_future_state="${GENERATE_FUTURE_STATE:-false}" \
