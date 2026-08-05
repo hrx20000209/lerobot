@@ -1,0 +1,387 @@
+#!/usr/bin/env python
+"""Instrumented Cosmos SO101 client: full trace + async screenshots.
+
+Same control loop as the stock ``robot_client``, plus:
+
+* a JSONL trace with one record per executed action -- commanded action, the
+  joint positions measured at that instant, the delta, action age, queue depth,
+  and the server-side stage breakdown (VAE encode / DiT denoise / ...) that the
+  profiling server attaches to the action metadata;
+* an observation trace (capture time, per-camera capture cost, queue depth);
+* screenshots written from a **background thread** at a fixed cadence, so JPEG
+  encoding never lands in the control loop and distorts the timings we are
+  trying to measure.
+
+``--shadow=true`` (default) makes it physically unable to write to the motor
+bus: ``send_action`` is replaced by a raiser and ``bus.sync_write`` refuses every
+``Goal_*`` register.  ``--shadow=false`` performs the run for real and the arm
+moves.  Both paths share this file so the instrumented code that gets validated
+in shadow is the same code that runs on hardware.
+"""
+
+import json
+import logging
+import queue
+import threading
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from pprint import pformat
+from typing import Any
+
+import draccus
+
+from lerobot.async_inference.configs import RobotClientConfig
+from lerobot.async_inference.robot_client import RobotClient
+from lerobot.utils.utils import init_logging
+
+SO101_ACTION_NAMES = [
+    "shoulder_pan.pos",
+    "shoulder_lift.pos",
+    "elbow_flex.pos",
+    "wrist_flex.pos",
+    "wrist_roll.pos",
+    "gripper.pos",
+]
+
+BLOCKED_REGISTERS = {"Goal_Position", "Goal_Current", "Goal_Velocity", "Goal_PWM"}
+
+
+class MotorWriteBlocked(RuntimeError):
+    """Raised when something attempts to command the arm during a shadow run."""
+
+
+@dataclass
+class ProfiledClientConfig(RobotClientConfig):
+    shadow: bool = field(
+        default=True,
+        metadata={"help": "True = motor bus is read-only (cannot move). False = REAL run, the arm moves."},
+    )
+    trace_dir: str = field(default="", metadata={"help": "Directory for traces + screenshots."})
+    screenshot_hz: float = field(default=2.0, metadata={"help": "Background screenshot rate. 0 disables."})
+    screenshot_quality: int = field(default=85, metadata={"help": "JPEG quality for screenshots."})
+    actuator_sample_every: int = field(
+        default=4,
+        metadata={
+            "help": "Read Present_Load/Temperature every Nth action (0 disables). "
+            "Each read costs a serial round-trip, so keep it well below the command rate."
+        },
+    )
+
+
+class ProfiledRobotClient(RobotClient):
+    prefix = "cosmos_profiled_client"
+    logger = logging.getLogger("cosmos_profiled_client")
+
+    def __init__(self, config: ProfiledClientConfig):
+        super().__init__(config)
+        self.shadow = config.shadow
+
+        features = list(self.robot.action_features)
+        if features != SO101_ACTION_NAMES:
+            raise RuntimeError(
+                "Robot action_features order does not match the Cosmos joint order.\n"
+                f"  robot.action_features = {features}\n"
+                f"  cosmos joint_order    = {SO101_ACTION_NAMES}\n"
+                "Actions are mapped positionally, so this would command the wrong joints."
+            )
+        self.logger.info("Verified action feature order: %s", features)
+
+        if self.shadow:
+            self._install_write_guards()
+            self.logger.warning("SHADOW: motor bus is read-only; the arm will NOT move.")
+        else:
+            self.logger.warning("REAL RUN: goal positions WILL be written to %s.", config.robot.port)
+
+        base = Path(config.trace_dir or self.latency_recorder.log_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        self.trace_dir = base
+        run_id = self.latency_recorder.run_id
+        self._action_trace = (base / f"action_trace_{run_id}.jsonl").open("w", buffering=1)
+        self._obs_trace = (base / f"observation_trace_{run_id}.jsonl").open("w", buffering=1)
+        self._trace_lock = threading.Lock()
+        self._n_actions = 0
+        self._n_obs = 0
+
+        self.shot_dir = base / f"screenshots_{run_id}"
+        self._shot_q: queue.Queue = queue.Queue(maxsize=8)
+        self._shot_stop = threading.Event()
+        self._shot_period = 1.0 / config.screenshot_hz if config.screenshot_hz > 0 else None
+        self._last_shot = 0.0
+        self._n_shots = 0
+        self._shot_thread = None
+        if self._shot_period is not None:
+            self.shot_dir.mkdir(parents=True, exist_ok=True)
+            self._shot_thread = threading.Thread(target=self._screenshot_worker, daemon=True)
+            self._shot_thread.start()
+            self.logger.info("Screenshots -> %s at %.1f Hz (background thread)", self.shot_dir, config.screenshot_hz)
+
+        self.logger.info("Traces -> %s", base)
+
+    # ---------------- write guards ----------------
+
+    def _install_write_guards(self) -> None:
+        robot = self.robot
+
+        def _blocked_send_action(action, *_a, **_kw):
+            raise MotorWriteBlocked(f"send_action() during a shadow run (action={action}); no write performed.")
+
+        robot.send_action = _blocked_send_action  # type: ignore[method-assign]
+
+        bus = robot.bus
+        original_sync_write = bus.sync_write
+
+        def _guarded_sync_write(data_name, *a, **kw):
+            if data_name in BLOCKED_REGISTERS:
+                raise MotorWriteBlocked(f"Refusing to sync_write {data_name!r}; the motor bus is read-only.")
+            return original_sync_write(data_name, *a, **kw)
+
+        bus.sync_write = _guarded_sync_write  # type: ignore[method-assign]
+
+    # ---------------- screenshots ----------------
+
+    def _screenshot_worker(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.logger.warning("PIL unavailable; screenshots disabled")
+            return
+        while not self._shot_stop.is_set():
+            try:
+                item = self._shot_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            timestep, wall, frames = item
+            for name, arr in frames.items():
+                try:
+                    Image.fromarray(arr).save(
+                        self.shot_dir / f"t{timestep:06d}_{wall:.3f}_{name}.jpg",
+                        quality=self.config.screenshot_quality,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a bad frame must not kill the run
+                    self.logger.debug("screenshot failed for %s: %s", name, exc)
+            self._n_shots += 1
+
+    def _maybe_queue_screenshot(self, raw_observation: dict, timestep: int) -> None:
+        if self._shot_period is None:
+            return
+        now = time.time()
+        if now - self._last_shot < self._shot_period:
+            return
+        frames = {}
+        for key, value in raw_observation.items():
+            arr = getattr(value, "shape", None)
+            if arr is not None and len(value.shape) == 3 and value.shape[-1] == 3:
+                # Copy: the camera buffer is reused by the next capture.
+                frames[str(key)] = value.copy()
+        if not frames:
+            return
+        try:
+            self._shot_q.put_nowait((timestep, now, frames))
+            self._last_shot = now
+        except queue.Full:
+            # Saver is behind; skip this one rather than block the control loop.
+            pass
+
+    # ---------------- instrumented loops ----------------
+
+    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+        get_start = time.perf_counter()
+        with self.action_queue_lock:
+            queue_size_before = self.action_queue.qsize()
+            self.action_queue_size.append(queue_size_before)
+            timed_action = self.action_queue.get_nowait()
+            queue_size_after = self.action_queue.qsize()
+        queue_pop_ms = (time.perf_counter() - get_start) * 1000
+
+        commanded = self._action_tensor_to_action_dict(timed_action.get_action())
+
+        exec_start = time.time()
+        send_start = time.perf_counter()
+        if self.shadow:
+            performed = None
+            present = self._read_present_position()
+        else:
+            # send_action itself reads Present_Position when max_relative_target
+            # is set; read it explicitly so the trace has it either way.
+            present = self._read_present_position()
+            performed = self.robot.send_action(commanded)
+        send_ms = (time.perf_counter() - send_start) * 1000
+        exec_end = time.time()
+
+        deltas = None
+        if present:
+            deltas = {
+                k: commanded[k] - present[k.removesuffix(".pos")]
+                for k in commanded
+                if k.removesuffix(".pos") in present
+            }
+
+        # Actuator state, sampled sparsely: tracking error only becomes
+        # actionable once you can tell "the policy asked for little" from
+        # "the servo could not deliver".
+        actuator = None
+        every = self.config.actuator_sample_every
+        if every and self._n_actions % every == 0:
+            actuator = self._read_actuator_state()
+
+        meta = timed_action.get_metadata()
+        server_meta = {}
+        src_ts = src_step = None
+        if isinstance(meta, dict):
+            src_ts = meta.get("source_observation_timestamp")
+            src_step = meta.get("source_observation_timestep")
+            server_meta = {
+                k: meta[k]
+                for k in (
+                    "stages_ms",
+                    "proprio",
+                    "raw_model_action_first",
+                    "raw_abs_max_delta",
+                    "num_denoising_steps_action",
+                    "dry_run_zero_actions",
+                    "server_timestamp",
+                )
+                if k in meta
+            }
+
+        record = {
+            "timestep": timed_action.get_timestep(),
+            "action_timestamp": timed_action.get_timestamp(),
+            "exec_start": exec_start,
+            "exec_end": exec_end,
+            "action_age_ms": (exec_start - timed_action.get_timestamp()) * 1000,
+            "source_observation_timestep": src_step,
+            "source_observation_timestamp": src_ts,
+            "observation_to_execution_ms": ((exec_start - src_ts) * 1000 if src_ts else None),
+            "queue_pop_ms": queue_pop_ms,
+            "robot_send_action_ms": send_ms,
+            "queue_size_before": queue_size_before,
+            "queue_size_after": queue_size_after,
+            "commanded_action": commanded,
+            "performed_action": performed,
+            "present_position": ({f"{k}.pos": v for k, v in present.items()} if present else None),
+            "delta_from_present": deltas,
+            "max_abs_delta": (max(abs(v) for v in deltas.values()) if deltas else None),
+            "written_to_motor_bus": not self.shadow,
+            "actuator": actuator,
+            "server": server_meta,
+        }
+        with self._trace_lock:
+            self._action_trace.write(json.dumps(record) + "\n")
+            self._n_actions += 1
+
+        self.latency_recorder.record(
+            "client_execute_action",
+            timestep=timed_action.get_timestep(),
+            queue_pop_ms=queue_pop_ms,
+            robot_send_action_ms=send_ms,
+            action_age_ms=(time.time() - timed_action.get_timestamp()) * 1000,
+            total_ms=queue_pop_ms + send_ms,
+        )
+        self._record_timeline(
+            "timeline_action",
+            timestep=timed_action.get_timestep(),
+            start_time=exec_start,
+            end_time=exec_end,
+            action_timestamp=timed_action.get_timestamp(),
+            source_observation_timestamp=src_ts,
+            source_observation_timestep=src_step,
+            queue_size_before=queue_size_before,
+            queue_size_after=queue_size_after,
+            commanded_action=commanded,
+            performed_action=performed,
+        )
+        with self.latest_action_lock:
+            self.latest_action = timed_action.get_timestep()
+            self.latest_action_wall_time = exec_end
+        return performed or {}
+
+    def _read_actuator_state(self):
+        out = {}
+        for reg, key in (("Present_Load", "load"), ("Present_Temperature", "temp_c")):
+            try:
+                out[key] = self.robot.bus.sync_read(reg)
+            except Exception as exc:  # noqa: BLE001 - never abort a run over telemetry
+                self.logger.debug("%s read failed: %s", reg, exc)
+        return out or None
+
+    def _read_present_position(self):
+        try:
+            return self.robot.bus.sync_read("Present_Position", num_retry=3)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("Present_Position read failed: %s", exc)
+            return None
+
+    def control_loop_observation(self, task: str, verbose: bool = False):
+        t0 = time.perf_counter()
+        raw = super().control_loop_observation(task, verbose)
+        total_ms = (time.perf_counter() - t0) * 1000
+        if raw is not None:
+            with self.action_queue_lock:
+                qsize = self.action_queue.qsize()
+            with self._trace_lock:
+                self._obs_trace.write(
+                    json.dumps(
+                        {
+                            "wall_time": time.time(),
+                            "capture_plus_send_ms": total_ms,
+                            "queue_size": qsize,
+                            "n": self._n_obs,
+                        }
+                    )
+                    + "\n"
+                )
+                self._n_obs += 1
+            self._maybe_queue_screenshot(raw, self._n_obs)
+        return raw
+
+    def stop(self) -> None:
+        super().stop()
+        self._shot_stop.set()
+        try:
+            self._shot_q.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._shot_thread is not None:
+            self._shot_thread.join(timeout=5)
+        for f in (self._action_trace, self._obs_trace):
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.logger.warning(
+            "Run complete: %d actions (%s), %d observations, %d screenshot sets -> %s",
+            self._n_actions,
+            "written to bus" if not self.shadow else "0 written to bus",
+            self._n_obs,
+            self._n_shots,
+            self.trace_dir,
+        )
+
+
+@draccus.wrap()
+def profiled_client(cfg: ProfiledClientConfig):
+    init_logging()
+    logging.info(pformat(asdict(cfg)))
+
+    client = ProfiledRobotClient(cfg)
+    if not client.start():
+        client.stop()
+        return
+
+    client.logger.info("Starting action receiver thread...")
+    receiver = threading.Thread(target=client.receive_actions, daemon=True)
+    receiver.start()
+    try:
+        client.control_loop(task=cfg.task)
+    finally:
+        client.stop()
+        receiver.join()
+        client.logger.info("Client stopped")
+
+
+if __name__ == "__main__":
+    profiled_client()

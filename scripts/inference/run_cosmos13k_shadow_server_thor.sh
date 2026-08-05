@@ -39,6 +39,9 @@ DRY_RUN="${DRY_RUN:-true}"
 # max_normalized_action_jump = 0.1225, i.e. up to ~20 deg on shoulder_lift in a
 # single step).  Restore the conservative values with:
 #   MAX_DELTA_FROM_OBS=8 MAX_GRIPPER_DELTA_FROM_OBS=8 MAX_STEP_DELTA=4 MAX_GRIPPER_STEP_DELTA=5
+PROFILE_STAGES="${PROFILE_STAGES:-false}"
+TRACE_PATH="${TRACE_PATH:-}"
+
 MAX_DELTA_FROM_OBS="${MAX_DELTA_FROM_OBS:-0}"
 MAX_GRIPPER_DELTA_FROM_OBS="${MAX_GRIPPER_DELTA_FROM_OBS:-0}"
 MAX_STEP_DELTA="${MAX_STEP_DELTA:-0}"
@@ -53,6 +56,19 @@ for p in "${CKPT_PATH}" "${TASK_ROOT}/processed_data/dataset_statistics.json" \
 done
 
 mkdir -p "${LOG_DIR}"
+
+# The command below runs under a pipe to tee, so this script's PID is the shell,
+# not python.  Killing the shell leaves the server orphaned and still bound --
+# and because two processes can end up listening on the same port, a stale
+# orphan will silently serve the client while the fresh server logs nothing.
+# Refuse to start rather than produce a run whose traces belong to another
+# process.
+if ss -ltn 2>/dev/null | grep -q ":${PORT}\b"; then
+  echo "ERROR: port ${PORT} is already in use. A previous server is still running." >&2
+  ss -ltnp 2>/dev/null | grep ":${PORT}\b" >&2 || true
+  echo "Stop it with:  pkill -9 -f so101_async_deploy_three_cubes_k16" >&2
+  exit 3
+fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export HF_HOME="${HF_HOME:-/home/hrx/.cache/huggingface}"
@@ -90,5 +106,7 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --max_gripper_delta_from_observation="${MAX_GRIPPER_DELTA_FROM_OBS}" \
   --max_step_delta="${MAX_STEP_DELTA}" \
   --max_gripper_step_delta="${MAX_GRIPPER_STEP_DELTA}" \
+  --profile_stages="${PROFILE_STAGES}" \
+  --trace_path="${TRACE_PATH:-${LOG_DIR}/server_stage_trace_${RUN_TAG}.jsonl}" \
   --dry_run_zero_actions="${DRY_RUN}" \
   "$@" 2>&1 | tee "${SERVER_LOG}"
