@@ -150,6 +150,8 @@ exec "${PYTHON_BIN}" -u -m cosmos_policy.experiments.robot.so101_async_deploy_th
   --t5_text_embeddings_path="${TASK_ROOT}/processed_data/t5_text_embeddings.pkl" \
   --num_denoising_steps_action="${NUM_DENOISING_STEPS}" \
   --actions_per_chunk="${ACTIONS_PER_CHUNK}" \
+  --action_gain="${ACTION_GAIN:-1.0}" \
+  --action_stride="${ACTION_STRIDE:-1}" \
   --truncate_vae_encode="${TRUNCATE_VAE_ENCODE}" \
   --generate_future_state="${GENERATE_FUTURE_STATE:-false}" \
   --future_state_dir="${FUTURE_STATE_DIR:-${LOG_DIR}/${RUN_TAG}_future_state}" \
