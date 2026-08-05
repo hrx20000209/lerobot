@@ -19,6 +19,7 @@
 # pytest tests/cameras/test_opencv.py::test_connect
 # ```
 
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -197,6 +198,17 @@ def test_read_latest():
 
         assert isinstance(latest, np.ndarray)
         assert latest.shape == frame.shape
+
+
+def test_read_latest_with_timestamp():
+    config = OpenCVCameraConfig(index_or_path=DEFAULT_PNG_FILE_PATH, warmup_s=0)
+
+    with OpenCVCamera(config) as camera:
+        frame, timestamp = camera.read_latest_with_timestamp()
+
+        assert isinstance(frame, np.ndarray)
+        assert isinstance(timestamp, float)
+        assert timestamp <= time.perf_counter()
 
 
 def test_read_latest_before_connect():

@@ -486,6 +486,12 @@ class RobotClient:
                     )
 
             except grpc.RpcError as e:
+                # ``stop()`` closes the channel to wake this thread if it is blocked
+                # in GetActions. gRPC reports that intentional local close as
+                # CANCELLED; it is normal shutdown, not a server/inference failure.
+                if not self.running and e.code() == grpc.StatusCode.CANCELLED:
+                    self.logger.debug("Action receiver stopped after the gRPC channel closed")
+                    break
                 self.logger.error(f"Error receiving actions: {e}")
 
     def actions_available(self):

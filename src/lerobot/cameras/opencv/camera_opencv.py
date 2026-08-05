@@ -107,6 +107,7 @@ class OpenCVCamera(Camera):
         self.fps = config.fps
         self.color_mode = config.color_mode
         self.warmup_s = config.warmup_s
+        self.read_fps = config.read_fps
 
         self.videocapture: cv2.VideoCapture | None = None
 
@@ -469,7 +470,9 @@ class OpenCVCamera(Camera):
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
+        min_read_period_s = 1.0 / float(self.read_fps) if self.read_fps is not None else 0.0
         while not stop_event.is_set():
+            read_started = time.perf_counter()
             try:
                 raw_frame = self._read_from_hardware()
                 processed_frame = self._postprocess_image(raw_frame)
@@ -480,6 +483,10 @@ class OpenCVCamera(Camera):
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
                 failure_count = 0
+                if min_read_period_s > 0.0:
+                    remaining_s = min_read_period_s - (time.perf_counter() - read_started)
+                    if remaining_s > 0.0:
+                        stop_event.wait(remaining_s)
 
             except DeviceNotConnectedError:
                 break
@@ -560,6 +567,29 @@ class OpenCVCamera(Camera):
 
         return frame
 
+    def _read_latest_with_timestamp(self, max_age_ms: int) -> tuple[NDArray[Any], float]:
+        with self.frame_lock:
+            frame = self.latest_frame
+            timestamp = self.latest_timestamp
+
+        if frame is None or timestamp is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
+            )
+        return frame, float(timestamp)
+
+    @check_if_not_connected
+    def read_latest_with_timestamp(self, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the latest frame and its monotonic software capture timestamp."""
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        return self._read_latest_with_timestamp(max_age_ms)
+
     @check_if_not_connected
     def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
         """Return the most recent frame captured immediately (Peeking).
@@ -580,19 +610,7 @@ class OpenCVCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
 
-        with self.frame_lock:
-            frame = self.latest_frame
-            timestamp = self.latest_timestamp
-
-        if frame is None or timestamp is None:
-            raise RuntimeError(f"{self} has not captured any frames yet.")
-
-        age_ms = (time.perf_counter() - timestamp) * 1e3
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
-            )
-
+        frame, _ = self._read_latest_with_timestamp(max_age_ms)
         return frame
 
     def disconnect(self) -> None:

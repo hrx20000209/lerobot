@@ -50,6 +50,7 @@ class OpenCVCameraConfig(CameraConfig):
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
         fourcc: FOURCC code for video format (e.g., "MJPG", "YUYV", "I420"). Defaults to None (auto-detect).
+        read_fps: Optional maximum background read-loop frequency. Defaults to None (unlimited).
         backend: OpenCV backend identifier (https://docs.opencv.org/3.4/d4/d15/group__videoio__flags__base.html). Defaults to ANY.
 
     Note:
@@ -63,6 +64,7 @@ class OpenCVCameraConfig(CameraConfig):
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
     fourcc: str | None = None
+    read_fps: float | None = None
     backend: Cv2Backends = Cv2Backends.ANY
 
     def __post_init__(self) -> None:
@@ -74,3 +76,5 @@ class OpenCVCameraConfig(CameraConfig):
             raise ValueError(
                 f"`fourcc` must be a 4-character string (e.g., 'MJPG', 'YUYV'), but '{self.fourcc}' is provided."
             )
+        if self.read_fps is not None and self.read_fps <= 0:
+            raise ValueError(f"`read_fps` must be positive or None, got {self.read_fps}.")
