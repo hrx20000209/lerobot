@@ -59,6 +59,13 @@ def main():
     out.mkdir(exist_ok=True)
 
     acts = [json.loads(l) for l in open(next(run.glob("action_trace_*.jsonl")))]
+    # A servo read can fail -- once, at shutdown, in the drop4 run -- leaving a
+    # record with no measured pose. One missing sample is not worth losing a run
+    # over, but it must be dropped rather than indexed into.
+    n_all = len(acts)
+    acts = [a for a in acts if a.get("present_position") and a.get("commanded_action")]
+    if len(acts) != n_all:
+        print(f"（跳过 {n_all - len(acts)} 条缺少实测位姿的记录）")
     obs = [json.loads(l) for l in open(next(run.glob("observation_trace_*.jsonl")))]
     srv_all = [json.loads(l) for l in open(args.server_trace)]
 
@@ -103,25 +110,28 @@ def main():
     # 14.92 for 5.5 s in this run -- so the release is the first departure from
     # that value in either direction. Closing further is the strongest evidence
     # of all: the fingers can only travel past where the cube was if it is gone.
-    # Find the pinned plateau: the longest stretch after the grasp over which the
-    # opening does not move. Anchoring on the grasp instant instead would read
-    # the value while the fingers are still closing and fire immediately.
-    best = (0, grasp_i, grasp_i)
+    # Take the *first* plateau that lasts hold_secs and is actually departed
+    # from before the run ends -- not the longest. A run that ends mid-hold (the
+    # gain=2 run holds the second cube for its final 45 s) has its longest
+    # plateau at the very end, which is not a completed task; and a run with two
+    # pick-and-place cycles must be scored on the first one. Anchoring on the
+    # grasp instant instead of scanning would read the value while the fingers
+    # are still closing and fire immediately.
+    plateau = None
     i = grasp_i
     while i < len(t):
         j = i + 1
         while j < len(t) and abs(grip[j] - grip[i]) <= 0.5:
             j += 1
-        if t[j - 1] - t[i] > best[0]:
-            best = (t[j - 1] - t[i], i, j - 1)
+        if t[j - 1] - t[i] >= args.hold_secs and j < len(t):
+            plateau = (t[j - 1] - t[i], i, j - 1)
+            break
         i = j
-    plateau_s, plat_lo, plat_hi = best
-    if plateau_s < args.hold_secs:
-        raise SystemExit(f"no pinned plateau after the grasp (longest {plateau_s:.1f}s)")
+    if plateau is None:
+        raise SystemExit("no pinned plateau that is released before the run ends")
+    plateau_s, plat_lo, plat_hi = plateau
     hold = float(np.median(grip[plat_lo:plat_hi + 1]))
     release_i = int(plat_hi) + 1
-    if release_i >= len(t):
-        raise SystemExit("the run ended while the object was still held")
     print(f"（夹爪被方块卡定在 {hold:.2f}，持续 {plateau_s:.1f}s：{rel[plat_lo]:.1f}–{rel[plat_hi]:.1f}s）")
     # Follow the excursion to its extreme, i.e. fully let go.
     k = release_i

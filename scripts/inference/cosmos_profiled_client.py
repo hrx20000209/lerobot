@@ -40,6 +40,8 @@ from lerobot.utils.utils import init_logging
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from action_feedback import ActionFeedback, FeedbackConfig  # noqa: E402
+from apex import Apex, ApexConfig  # noqa: E402
+from chunk_reanchor import ChunkReanchor, ReanchorConfig  # noqa: E402
 
 SO101_ACTION_NAMES = [
     "shoulder_pan.pos",
@@ -83,6 +85,35 @@ class ProfiledClientConfig(RobotClientConfig):
         default=0.0,
         metadata={"help": "Observe (do not act) for this long, then raise the thresholds to fit. 0 = fixed."},
     )
+    fb_gripper_lead_deg: float = field(
+        default=0.0,
+        metadata={"help": "Gripper-only lead limit, deg. Off by default: it clips healthy grasps too. 0 = use fb_max_lead_deg."},
+    )
+    fb_fixed_point_secs: float = field(
+        default=0.0,
+        metadata={"help": "Net-displacement window, s. Below the move threshold over it (while squeezing) = release. 0 = off."},
+    )
+    fb_fixed_point_move_deg: float = field(
+        default=3.0, metadata={"help": "Net displacement over the window counting as going nowhere."}
+    )
+    fb_fixed_point_release_deg: float = field(
+        default=30.0, metadata={"help": "How far to open the gripper to break a fixed point."}
+    )
+    # --- APEX adaptive execution layer (see apex.py, arXiv:2606.16504) ---
+    apex: bool = field(default=False, metadata={"help": "Enable the APEX execution-gap correction."})
+    apex_k1: float = field(default=12.0, metadata={"help": "Reconstruction filter gain K1, 1/s."})
+    apex_k2: float = field(default=12.0, metadata={"help": "Reconstruction filter gain K2, 1/s."})
+    apex_alpha: float = field(default=6.0, metadata={"help": "Tracking-error feedback gain alpha."})
+    apex_gamma_w: float = field(default=2.0e-4, metadata={"help": "Learning rate for w."})
+    apex_gamma_wd: float = field(default=2.0e-4, metadata={"help": "Learning rate for w_d."})
+    apex_gamma_j: float = field(default=2.0e-5, metadata={"help": "Learning rate for J."})
+    apex_warmup_secs: float = field(default=1.5, metadata={"help": "Pass the policy command through for this long."})
+    apex_max_correction_deg: float = field(
+        default=12.0, metadata={"help": "Hard bound on |corrected - policy|, deg."}
+    )
+    # --- chunk re-anchoring (see chunk_reanchor.py) ---
+    reanchor: bool = field(default=False, metadata={"help": "Re-anchor each chunk to the measured pose."})
+    reanchor_blend_steps: int = field(default=8, metadata={"help": "Actions over which the offset decays to zero."})
 
 
 class ProfiledRobotClient(RobotClient):
@@ -143,14 +174,58 @@ class ProfiledRobotClient(RobotClient):
                 stall_load=config.fb_stall_load,
                 stall_secs=config.fb_stall_secs,
                 autotune_secs=config.fb_autotune_secs,
+                max_lead_deg_per_joint=(
+                    {"gripper.pos": config.fb_gripper_lead_deg}
+                    if config.fb_gripper_lead_deg > 0
+                    else {}
+                ),
+                fixed_point_secs=config.fb_fixed_point_secs,
+                fixed_point_move_deg=config.fb_fixed_point_move_deg,
+                fixed_point_release_deg=config.fb_fixed_point_release_deg,
             ),
         )
+        self.apex = Apex(
+            SO101_ACTION_NAMES,
+            ApexConfig(
+                enabled=config.apex,
+                k1=config.apex_k1,
+                k2=config.apex_k2,
+                alpha=config.apex_alpha,
+                gamma_w=config.apex_gamma_w,
+                gamma_wd=config.apex_gamma_wd,
+                gamma_j=config.apex_gamma_j,
+                warmup_secs=config.apex_warmup_secs,
+                max_correction_deg=config.apex_max_correction_deg,
+            ),
+        )
+        if config.apex:
+            self.logger.warning(
+                "APEX ON: K1=%.1f K2=%.1f alpha=%.1f  gamma=(%.1e,%.1e,%.1e)  "
+                "warmup=%.1fs  |correction|<=%.1f deg  (gripper excluded)",
+                config.apex_k1, config.apex_k2, config.apex_alpha,
+                config.apex_gamma_w, config.apex_gamma_wd, config.apex_gamma_j,
+                config.apex_warmup_secs, config.apex_max_correction_deg,
+            )
+
+        self.reanchor = ChunkReanchor(
+            SO101_ACTION_NAMES,
+            ReanchorConfig(enabled=config.reanchor, blend_steps=config.reanchor_blend_steps),
+        )
+        if config.reanchor:
+            self.logger.warning(
+                "REANCHOR ON: each chunk shifted onto the measured pose, decaying over %d actions",
+                config.reanchor_blend_steps,
+            )
+
         self._last_load: np.ndarray | None = None
         if config.feedback:
             self.logger.warning(
-                "FEEDBACK ON: slew=%.1f deg  lead=%.1f deg  stall=|load|>=%.0f for %.1fs",
-                config.fb_max_step_deg, config.fb_max_lead_deg,
+                "FEEDBACK ON: slew=%.1f deg  lead=%.1f deg (gripper %.1f)  "
+                "stall=|load|>=%.0f for %.1fs  fixed-point=%.1fs/%.1fdeg -> open %.0f deg",
+                config.fb_max_step_deg, config.fb_max_lead_deg, config.fb_gripper_lead_deg,
                 config.fb_stall_load, config.fb_stall_secs,
+                config.fb_fixed_point_secs, config.fb_fixed_point_move_deg,
+                config.fb_fixed_point_release_deg,
             )
 
     # ---------------- write guards ----------------
@@ -240,9 +315,24 @@ class ProfiledRobotClient(RobotClient):
         # set; read it explicitly so the trace has it either way -- and because
         # the feedback guards need the live measurement before the write.
         present = self._read_present_position()
-        if present and self.feedback.cfg.enabled:
+        if present and (self.reanchor.cfg.enabled or self.apex.cfg.enabled or self.feedback.cfg.enabled):
             cmd_vec = np.array([commanded[j] for j in SO101_ACTION_NAMES], dtype=np.float64)
             pres_vec = np.array([present[j.removesuffix(".pos")] for j in SO101_ACTION_NAMES], dtype=np.float64)
+            # APEX first: it reconstructs the reference the servo loop is
+            # missing and adds lead. The guards run after it, on its output,
+            # because their job is to bound whatever finally reaches the bus --
+            # including APEX's own correction if adaptation misbehaves.
+            # Re-anchor before anything else: it removes the stale-observation
+            # offset the chunk arrived with, so every guard downstream sees the
+            # command the policy meant for *now* rather than for 415 ms ago.
+            # The chunk is identified by the observation it was computed from,
+            # not by the action's own timestep -- that increments every action,
+            # which would make every step look like a chunk boundary and pin
+            # the command onto the measurement forever.
+            _m = timed_action.get_metadata()
+            _src = _m.get("source_observation_timestep") if isinstance(_m, dict) else None
+            cmd_vec = self.reanchor.apply(cmd_vec, pres_vec, _src)
+            cmd_vec = self.apex.step(cmd_vec, pres_vec, exec_start)
             adjusted = self.feedback.apply(cmd_vec, pres_vec, self._last_load, exec_start)
             commanded = {j: float(v) for j, v in zip(SO101_ACTION_NAMES, adjusted)}
         performed = None if self.shadow else self.robot.send_action(commanded)
@@ -406,6 +496,11 @@ class ProfiledRobotClient(RobotClient):
             self._n_shots,
             self.trace_dir,
         )
+        if self.reanchor.cfg.enabled:
+            self.logger.warning("REANCHOR: %s", self.reanchor.stats.as_dict())
+        if self.apex.cfg.enabled:
+            self.apex.finalize()
+            self.logger.warning("APEX: %s", self.apex.stats.as_dict())
         if self.feedback.cfg.enabled:
             s = self.feedback.stats
             n = max(s.n_commands, 1)
@@ -415,6 +510,10 @@ class ProfiledRobotClient(RobotClient):
                 s.n_slew_clipped, s.n_commands, 100 * s.n_slew_clipped / n, s.max_slew_clip_deg,
                 s.n_lead_clipped, 100 * s.n_lead_clipped / n, s.max_lead_clip_deg,
                 s.n_stall_frozen, s.stalled_joints or "",
+            )
+            self.logger.warning(
+                "FEEDBACK: fixed points detected %d at t=%s (%d release commands issued)",
+                s.n_fixed_point, s.fixed_point_at or "-", s.n_release_commands,
             )
             if self.feedback.autotuned:
                 self.logger.warning("FEEDBACK autotuned -> %s", self.feedback.autotuned)
